@@ -1,0 +1,12 @@
+name: spanwall
+label: SpanWall
+version: 1.0.0
+author: tuanpv47
+homepage: https://github.com/tuanpv47/spanwall
+description: >
+  One Kanban wall for every Hermes session, across every profile. Sessions sit
+  in Needs you, Running, Idle, Done (24h) and Failed columns; approve requests,
+  answer clarify, sudo and secret prompts, chat, steer and stop agents right
+  from the card. Desktop-only (desktop/plugin.js); no agent tools, hooks,
+  middleware or env vars.
+tags: [desktop, sessions, kanban]

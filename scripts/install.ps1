@@ -5,7 +5,7 @@ param([switch]$Link)
 
 $ErrorActionPreference = 'Stop'
 $hermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:USERPROFILE '.hermes' }
-$source = Resolve-Path (Join-Path $PSScriptRoot '..\plugin\spanwall\plugin.js')
+$source = Resolve-Path (Join-Path $PSScriptRoot '..\plugin\spanwall\desktop\plugin.js')
 $targetDir = Join-Path $hermesHome 'desktop-plugins\spanwall'
 $target = Join-Path $targetDir 'plugin.js'
 

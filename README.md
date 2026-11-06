@@ -70,13 +70,13 @@ Catalog installs are pinned to a reviewed commit. Update with `hermes plugins up
 
 ### From this repo
 
-Copy `plugin/spanwall/plugin.js` to `$HERMES_HOME/desktop-plugins/spanwall/plugin.js`.
+Copy `plugin/spanwall/desktop/plugin.js` to `$HERMES_HOME/desktop-plugins/spanwall/plugin.js`.
 
 On macOS or Linux (`$HERMES_HOME` defaults to `~/.hermes`):
 
 ```sh
 mkdir -p ~/.hermes/desktop-plugins/spanwall
-cp plugin/spanwall/plugin.js ~/.hermes/desktop-plugins/spanwall/
+cp plugin/spanwall/desktop/plugin.js ~/.hermes/desktop-plugins/spanwall/
 ```
 
 On Windows, the install script does it:
@@ -134,7 +134,9 @@ Profiles come from `host.profileRoutes()`. Every RPC for a session goes through
 
 ```
 spanwall/
-├── plugin/spanwall/plugin.js
+├── plugin/spanwall/
+│   ├── plugin.yaml
+│   └── desktop/plugin.js
 ├── scripts/install.ps1
 ├── assets/
 └── LICENSE
