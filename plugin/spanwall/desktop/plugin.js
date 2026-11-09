@@ -137,6 +137,7 @@ function createBoard(ctx) {
     seq: new Map(), // uid → events watermark for session.events.since
     rawIndex: new Map(), // runtime id → uid (gateway events carry only the runtime id)
     archive: readArchive(), // uid → finished turn summary (survives reloads, 24h)
+    deleted: new Map(), // session id (stored or runtime) → deletedAt: keeps an in-flight poll from bringing it back
     connected: true,
     lastError: null
   }
@@ -713,6 +714,50 @@ function createBoard(ctx) {
     emit()
   }
 
+  // Delete a session for good (its stored row + transcripts). The backend refuses a session that is
+  // live in it, so a live one is stopped (releasing any approval / clarify wait) and closed first —
+  // the order Hermes' own sidebar uses. Throws; the caller shows the error.
+  async function remove(item) {
+    const route = routeOf(item.routeKey)
+    if (!route) throw new Error('The profile that owns this session is not connected')
+    const gone = err => /not found|unknown session|4001|4007/i.test(`${errorText(err)} ${err?.code ?? ''}`)
+    if (item.live) {
+      if (item.column === 'running' || item.requests.length) {
+        await sessionRpc(item.id, 'session.interrupt').catch(err => {
+          if (!gone(err)) throw err
+        })
+      }
+      await sessionRpc(item.id, 'session.close').catch(() => {})
+    }
+    try {
+      await rpc(route.route, 'session.delete', { session_id: item.key, profile: backendProfile(route) }, true)
+    } catch (err) {
+      if (!gone(err)) throw err // already gone (a live session that never wrote a row): nothing to delete
+    }
+    forget(item)
+  }
+
+  function forget(item) {
+    const at = Date.now()
+    for (const [id, t] of state.deleted) if (at - t > 120000) state.deleted.delete(id)
+    for (const id of [item.key, item.rawId]) if (id) state.deleted.set(id, at)
+    for (const [uid, s] of state.sessions) if (uid === item.id || s.session_key === item.key) dropSession(uid)
+    for (const [uid, rec] of state.archive) {
+      if (uid !== item.id && rec.key !== item.key) continue
+      state.archive.delete(uid)
+      state.turns.delete(uid)
+    }
+    saveArchive()
+    for (const st of state.stored.values()) {
+      if (st?.rows) st.rows = st.rows.filter(r => r.id !== item.key && r.id !== item.rawId && r.resolved_id !== item.key)
+    }
+    state.transcript.delete(item.id)
+    state.mounted.delete(item.key)
+    if (state.viewing === item.id || state.viewingKey === item.key) closeViewer()
+    emit()
+    pollSoon(400)
+  }
+
   function dismiss(uid) {
     const t = turn(uid)
     t.dismissedAt = Date.now()
@@ -866,7 +911,7 @@ function createBoard(ctx) {
         }
       }
     }
-    return out
+    return state.deleted.size ? out.filter(i => !state.deleted.has(i.key) && !state.deleted.has(i.rawId)) : out
   }
 
   function refresh() {
@@ -988,6 +1033,7 @@ function createBoard(ctx) {
     send,
     interrupt,
     dismiss,
+    remove,
     open,
     setHidden,
     items
@@ -1085,6 +1131,13 @@ const CSS = `
 .hb-btn.hb-primary{background:var(--hb-fg);color:var(--hb-card);border-color:var(--hb-fg)}
 .hb-btn.hb-primary:hover{opacity:.88;background:var(--hb-fg)}
 .hb-btn.hb-small{height:24px;padding:0 9px;font-size:12px}
+.hb-btn.hb-danger{background:var(--hb-fail);border-color:var(--hb-fail);color:#fff}
+.hb-btn.hb-danger:hover{background:color-mix(in srgb,var(--hb-fail) 88%,#000)}
+.hb-ext.hb-ext-danger:hover{color:var(--hb-fail);background:color-mix(in srgb,var(--hb-fail) 10%,transparent)}
+.hb-modal.hb-confirm{max-width:440px}
+.hb-confirm-text{margin:0;font-size:13.5px;line-height:1.55;color:var(--hb-fg2);word-break:break-word}
+.hb-confirm-text b{color:var(--hb-fg);font-weight:600}
+.hb-confirm-warn{display:flex;align-items:center;gap:6px;color:var(--hb-needs)}
 .hb-input,.hb-textarea{width:100%;box-sizing:border-box;border-radius:7px;border:1px solid var(--hb-line);background:transparent;color:inherit;font:inherit;padding:6px 8px;outline:none}
 .hb-input:focus,.hb-textarea:focus{border-color:var(--hb-accent)}
 .hb-textarea{resize:vertical;min-height:34px;max-height:160px}
@@ -1344,6 +1397,7 @@ const ICONS = {
   arrowUp: 'M8 13V3.5M3.5 8L8 3.5 12.5 8',
   expand: 'M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5L9 7M2.5 13.5L7 9',
   copy: 'M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3',
+  trash: 'M2.5 4.5h11M6.5 4.5V2.5h3v2M4 4.5l.7 9h6.6l.7-9M6.7 7v4.5M9.3 7v4.5',
   panel: 'M2.5 3.5h11v9h-11zM10 3.5v9'
 }
 
@@ -1530,7 +1584,8 @@ function BoardPage({ board, ctx }) {
     writeStored(ctx, 'view', v)
   }
 
-  const renderCard = it => h(Card, { key: it.id, item: it, board, now, multiProfile: routes.length > 1, open: isOpen(it), onToggle: () => toggle(it) })
+  const [doomed, setDoomed] = useState(null) // card waiting on the delete confirmation
+  const renderCard = it => h(Card, { key: it.id, item: it, board, now, multiProfile: routes.length > 1, open: isOpen(it), onToggle: () => toggle(it), onDelete: () => setDoomed(it) })
 
   return h('div', { className: 'hb-root', ref: rootRef },
     h('div', { className: 'hb-head' },
@@ -1554,6 +1609,7 @@ function BoardPage({ board, ctx }) {
     routes.length > 1 && h(ProfileBar, { items: matching, routes, filterKey, onPick: pickProfile }),
     board.state.viewing && h(SessionModal, { key: board.state.viewing, board, ctx,
       item: all.find(i => i.live && i.key === board.state.viewingKey) || all.find(i => i.id === board.state.viewing) || null }),
+    doomed && h(DeleteDialog, { key: doomed.id, board, item: all.find(i => i.id === doomed.id) || doomed, onClose: () => setDoomed(null) }),
     board.state.compose && h(NewTaskPanel, { key: board.state.compose.at, board, ctx, initialRouteKey: board.state.compose.routeKey || filterKey }),
     view === 'board'
       ? h('div', { className: 'hb-board' },
@@ -1963,7 +2019,7 @@ function cardPreview(item) {
   return item.preview
 }
 
-function Card({ item, board, now, multiProfile, open, onToggle }) {
+function Card({ item, board, now, multiProfile, open, onToggle, onDelete }) {
   const header = h('div', { className: 'hb-cardhead', onClick: onToggle, role: 'button', 'aria-expanded': open, tabIndex: 0, onKeyDown: e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), onToggle()) },
     h('span', { className: `hb-c-${item.column}`, style: { marginTop: 2 } }, h(Icon, { name: 'sparkle', size: 13, fill: true })),
     h('span', { className: 'hb-title' },
@@ -1974,7 +2030,8 @@ function Card({ item, board, now, multiProfile, open, onToggle }) {
     // Actions float over the title's end on hover, so the title keeps the full card width.
     h('span', { className: 'hb-card-actions' },
       h('button', { className: 'hb-ext', title: 'View session', onClick: e => (e.stopPropagation(), board.openViewer(item)) }, h(Icon, { name: 'expand', size: 12 })),
-      h('button', { className: 'hb-ext', title: 'Open in Hermes', onClick: e => (e.stopPropagation(), void board.open(item)) }, h(Icon, { name: 'ext', size: 12 }))))
+      h('button', { className: 'hb-ext', title: 'Open in Hermes', onClick: e => (e.stopPropagation(), void board.open(item)) }, h(Icon, { name: 'ext', size: 12 })),
+      onDelete && h('button', { className: 'hb-ext hb-ext-danger', title: 'Delete session', onClick: e => (e.stopPropagation(), onDelete()) }, h(Icon, { name: 'trash', size: 12 }))))
 
   return h('article', { className: `hb-card${open ? ' hb-sel' : ''}${item.column === 'running' ? ' hb-running' : ''}`, 'data-card-id': item.id, 'data-col': item.column },
     header,
@@ -1985,6 +2042,58 @@ function Card({ item, board, now, multiProfile, open, onToggle }) {
       item.messageCount != null && h('span', { className: 'hb-m', title: 'Messages' }, h(Icon, { name: 'chat', size: 12 }), item.messageCount),
       multiProfile && h('span', { className: 'hb-meta-end' }, h(ProfileTag, { item }))),
     open && h(CardBody, { item, board, now }))
+}
+
+// ── delete confirmation ──
+
+function DeleteDialog({ board, item, onClose }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const cancelRef = useRef(null)
+  const busyRef = useRef(false)
+  busyRef.current = busy
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  useEffect(() => {
+    cancelRef.current?.focus() // the safe choice holds the focus
+    const onKey = e => {
+      if (e.key !== 'Escape' || e.isComposing) return
+      e.preventDefault()
+      e.stopPropagation()
+      if (!busyRef.current) closeRef.current()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+
+  const confirm = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await board.remove(item)
+      host.notify({ kind: 'info', message: 'Session deleted' })
+      onClose()
+    } catch (err) {
+      setError(errorText(err))
+      setBusy(false)
+    }
+  }
+
+  const stops = item.live && (item.column === 'running' || item.requests.length > 0)
+  return h('div', { className: 'hb-modal-backdrop', onMouseDown: e => e.target === e.currentTarget && !busy && onClose() },
+    h('div', { className: 'hb-modal hb-confirm', role: 'alertdialog', 'aria-modal': true, 'aria-labelledby': 'hb-del-title', 'aria-describedby': 'hb-del-desc' },
+      h('div', { className: 'hb-modal-head' }, h('div', null, h('div', { id: 'hb-del-title', className: 'hb-modal-title' }, 'Delete session?'))),
+      h('div', { className: 'hb-modal-body' },
+        h('p', { id: 'hb-del-desc', className: 'hb-confirm-text' },
+          h('b', null, item.title), ' and its transcript will be permanently deleted',
+          item.profileLabel ? h(Fragment, null, ' from ', h('b', null, item.profileLabel)) : null, ". This can't be undone."),
+        stops && h('p', { className: 'hb-confirm-text hb-confirm-warn' }, h(Icon, { name: 'warn', size: 12 }),
+          item.column === 'running' ? 'The running turn will be stopped first.' : 'Its pending request will be cancelled first.'),
+        error && h('div', { className: 'hb-modal-err' }, `Could not delete the session: ${error}`),
+        h('div', { className: 'hb-row hb-end' },
+          h('button', { ref: cancelRef, className: 'hb-btn', disabled: busy, onClick: onClose }, 'Cancel'),
+          h('button', { className: 'hb-btn hb-danger', disabled: busy, onClick: () => void confirm() },
+            busy ? h('span', { className: 'hb-spin hb-spin-light' }) : h(Icon, { name: 'trash', size: 12 }), busy ? 'Deleting…' : 'Delete')))))
 }
 
 // ── session viewer ──
