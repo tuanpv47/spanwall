@@ -3,11 +3,6 @@ label: SpanWall
 version: 1.0.1
 author: tuanpv47
 homepage: https://github.com/tuanpv47/spanwall
-description: >
-  One Kanban wall for every Hermes session, across every profile. Sessions sit
-  in Needs you, Running, Idle, Done (24h) and Failed columns; approve requests,
-  answer clarify, sudo and secret prompts, chat, steer and stop agents right
-  from the card. Desktop-only (desktop/plugin.js); no agent tools, hooks,
-  middleware or env vars.
+description: "One Kanban wall for every Hermes session, across every profile: Needs you, Running, Idle, Done (24h) and Failed columns, one card per session. Approve requests, answer clarify, sudo and secret prompts, chat, steer and stop agents right from the card. Desktop-only (desktop/plugin.js inside the plugin SDK surface); no agent tools, hooks, middleware or env vars. Disclosure — acts on the sessions of every watched profile, not only the active one: approving or rejecting requests, sending prompts, steering, interrupting and creating sessions there, each only on an explicit click (nothing is approved automatically). Sudo passwords and secrets typed into a card go straight to the owning gateway and are not stored. Polls every watched profile's gateway every 3 s, which may start that profile's backend. Keeps UI preferences and a 24-hour archive of finished turns (title, profile, model, tools used, the error message if any, the first 600 characters of the reply) in the Desktop's plugin storage. No network calls outside the Hermes gateways, no telemetry."
 tags: [desktop, sessions, kanban]
 requires_hermes: ">=0.22.2"
