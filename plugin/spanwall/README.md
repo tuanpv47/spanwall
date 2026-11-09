@@ -66,22 +66,26 @@ Update with `hermes plugins update spanwall`, uninstall with `hermes plugins rem
 - **Recent saved sessions**: show up to 8 recent saved sessions per profile in the Idle column.
 - **Rescan**: reload the profile list.
 
-## What it does with your data
+## Disclosure
 
-- **Acts on every watched profile**, not only the active one: approving or rejecting requests,
-  sending prompts, steering, interrupting and creating sessions there. Each is an explicit click;
-  nothing is approved or answered automatically.
-- **Sudo passwords and secrets** typed into a card go straight to the owning gateway. SpanWall does
-  not store, log or display them.
-- **Polling**: every watched profile's gateway every 3 seconds (usage every 15 s, profile list and
-  saved sessions every 30 s). Polling a profile may start its backend; untick the profiles you
-  don't need.
-- **Stored in the Desktop's plugin storage**: UI preferences (watched profiles, filters, view, viewer
-  size, New task options) and a 24-hour archive of finished turns (session title, profile, model,
-  tools used, the error message if any, and the first 600 characters of the reply), so the Done and
-  Failed columns survive a reload.
-  Entries older than 24 hours are dropped.
-- **No network calls** outside the Hermes gateways, and no telemetry.
+- **Acts on the sessions of every watched profile**, not only the active one: approving or
+  rejecting requests, sending prompts, steering, interrupting and creating sessions there, each
+  only on an explicit click (nothing is approved automatically).
+- **Sudo passwords and secrets** typed into a card go straight to the owning gateway and are not
+  stored.
+- **Polls every watched profile's gateway every 3 s** (usage every 15 s, profile list and saved
+  sessions every 30 s), which may start that profile's backend. Untick the profiles you don't need
+  in Settings.
+- **Keeps UI preferences and a 24-hour archive of finished turns** in the Desktop's plugin storage.
+  Preferences are the watched profiles, filters, view, viewer size and New task options. Each
+  archived turn holds the session title, profile, model, tools used, the error message if any, and
+  the first 600 characters of the reply, so the Done and Failed columns survive a reload. Turns
+  older than 24 hours are dropped.
+- **No network calls outside the Hermes gateways, no telemetry.**
+
+## Known issues
+
+- Developed and tested on Windows 10 only; macOS and Linux are untested.
 
 ## Source
 
