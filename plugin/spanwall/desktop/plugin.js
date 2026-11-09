@@ -18,7 +18,7 @@ import * as React from 'react'
 import * as sdk from '@hermes/plugin-sdk'
 
 const { host, useValue } = sdk
-const { createElement: h, Fragment, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } = React
+const { createElement: h, Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } = React
 
 const PLUGIN_ID = 'spanwall'
 const ROUTE = '/spanwall'
@@ -1108,6 +1108,14 @@ const CSS = `
 .hb-vresize:after{content:"";position:absolute;top:50%;left:3px;width:4px;height:44px;margin-top:-22px;border-radius:4px;background:var(--hb-fg4);opacity:0;transition:opacity .15s}
 .hb-vresize:hover:after,.hb-resizing .hb-vresize:after{opacity:.7}
 .hb-viewer.hb-resizing{user-select:none;animation:none}
+.hb-viewer[data-slot]{-webkit-backdrop-filter:none;backdrop-filter:none}
+.hb-viewer .hb-transcript,.hb-viewer .hb-vside{-webkit-user-select:text;user-select:text}
+.hb-viewer button,.hb-viewer.hb-resizing *{-webkit-user-select:none;user-select:none}
+.hb-ctxmenu{position:fixed;z-index:1001;min-width:180px;padding:4px;display:flex;flex-direction:column;border-radius:10px;background:var(--hb-card);color:var(--hb-fg);border:1px solid var(--hb-line);box-shadow:0 12px 32px -8px rgba(0,0,0,.35);font-size:13px;animation:hb-fade .08s ease-out}
+.hb-ctxitem{display:flex;align-items:center;gap:16px;border:0;background:transparent;color:inherit;font:inherit;padding:6px 10px;border-radius:6px;cursor:pointer;text-align:left}
+.hb-ctxitem:hover:not(:disabled),.hb-ctxitem:focus-visible{outline:none;background:color-mix(in srgb,var(--hb-accent) 14%,transparent)}
+.hb-ctxitem:disabled{color:var(--hb-fg4);cursor:default}
+.hb-ctxkey{margin-left:auto;color:var(--hb-fg4);font-size:11.5px}
 .hb-vbar{display:flex;align-items:center;gap:10px;height:52px;padding:0 10px 0 8px;border-bottom:1px solid var(--hb-line);flex:none;min-width:0}
 .hb-vbar-title{font-size:14.5px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:60px;max-width:40%}
 .hb-ghost.hb-on{color:var(--hb-fg);background:color-mix(in srgb,currentColor 8%,transparent)}
@@ -2283,6 +2291,101 @@ function TranscriptRow({ m, item, onExpand }) {
     open && h('div', { className: 'hb-sys-body' }, h(RichText, { text: clip(m.text, 40000), item })))
 }
 
+// ── right-click Copy / Cut / Paste ──
+//
+// Hermes Desktop answers every right-click with its own app menu (a window capture listener that
+// stops propagation), which portals into the viewer via its data-slot. This menu only runs on hosts
+// without that listener.
+
+const MOD_KEY = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '') ? '⌘' : 'Ctrl+'
+
+// A text field the menu can edit: textarea / text-like input that exposes a selection range.
+function textFieldOf(el) {
+  const f = el?.closest?.('textarea, input')
+  return f && typeof f.selectionStart === 'number' ? f : null
+}
+
+// Replace [start, end) of a field with `str` the way typing would, so React's onChange and undo see it.
+function insertInto(el, start, end, str) {
+  el.focus()
+  try {
+    el.setSelectionRange(start, end)
+  } catch {}
+  try {
+    if (document.execCommand(str ? 'insertText' : 'delete', false, str)) return
+  } catch {}
+  const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, el.value.slice(0, start) + str + el.value.slice(end))
+  el.setSelectionRange(start + str.length, start + str.length)
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+// What a right-click at `e` can act on, or null when there is nothing to offer.
+function contextMenuAt(e) {
+  const field = textFieldOf(e.target)
+  if (field) {
+    const start = field.selectionStart
+    const end = field.selectionEnd
+    const secret = field.type === 'password'
+    const writable = !field.readOnly && !field.disabled
+    const text = secret ? '' : field.value.slice(start, end)
+    return { x: e.clientX, y: e.clientY, text, field, start, end, canCut: writable && Boolean(text), canPaste: writable }
+  }
+  const text = window.getSelection?.()?.toString() || ''
+  return text ? { x: e.clientX, y: e.clientY, text, field: null, canCut: false, canPaste: false } : null
+}
+
+function ContextMenu({ menu, onClose }) {
+  const ref = useRef(null)
+  const [pos, setPos] = useState({ left: menu.x, top: menu.y })
+  useLayoutEffect(() => {
+    const r = ref.current?.getBoundingClientRect()
+    if (!r) return
+    setPos({ left: Math.max(4, Math.min(menu.x, window.innerWidth - r.width - 4)), top: Math.max(4, Math.min(menu.y, window.innerHeight - r.height - 4)) })
+  }, [menu])
+  useEffect(() => {
+    const away = e => !ref.current?.contains(e.target) && onClose()
+    const dismiss = () => onClose()
+    window.addEventListener('mousedown', away, true)
+    window.addEventListener('scroll', dismiss, true)
+    window.addEventListener('resize', dismiss)
+    window.addEventListener('blur', dismiss)
+    return () => {
+      window.removeEventListener('mousedown', away, true)
+      window.removeEventListener('scroll', dismiss, true)
+      window.removeEventListener('resize', dismiss)
+      window.removeEventListener('blur', dismiss)
+    }
+  }, [onClose])
+
+  const run = fn => async () => {
+    onClose()
+    try {
+      await fn()
+    } catch (err) {
+      host.notifyError(err, 'Clipboard action failed')
+    }
+  }
+  const { field, start, end, text } = menu
+  const items = [
+    field && { label: 'Cut', key: 'X', enabled: menu.canCut, act: async () => {
+      await navigator.clipboard.writeText(text)
+      insertInto(field, start, end, '')
+    } },
+    { label: 'Copy', key: 'C', enabled: Boolean(text), act: async () => {
+      await navigator.clipboard.writeText(text)
+      field?.focus()
+    } },
+    field && { label: 'Paste', key: 'V', enabled: menu.canPaste, act: async () => insertInto(field, start, end, await navigator.clipboard.readText()) }
+  ].filter(Boolean)
+
+  return h('div', { ref, className: 'hb-ctxmenu', role: 'menu', style: pos,
+    onMouseDown: e => e.preventDefault(), // keep the selection and the field's focus
+    onContextMenu: e => e.preventDefault() },
+    items.map(it => h('button', { key: it.label, className: 'hb-ctxitem', role: 'menuitem', disabled: !it.enabled, onClick: run(it.act) },
+      it.label, h('span', { className: 'hb-ctxkey' }, `${MOD_KEY}${it.key}`))))
+}
+
 // A session opened in place, laid out like a Hermes chat: full-window, a centred transcript column,
 // the composer at the bottom and a collapsible details panel. Esc closes (window-level).
 function SessionModal({ board, ctx, item: liveItem }) {
@@ -2344,13 +2447,26 @@ function SessionModal({ board, ctx, item: liveItem }) {
   const close = () => board.closeViewer()
   const closeRef = useRef(close)
   closeRef.current = close
+  const [menu, setMenu] = useState(null) // right-click Copy / Cut / Paste
+  const menuOpen = useRef(false)
+  menuOpen.current = Boolean(menu)
+  const closeMenu = useCallback(() => setMenu(null), [])
+  const openMenu = e => {
+    const m = contextMenuAt(e)
+    setMenu(m)
+    if (!m) return
+    e.preventDefault()
+    e.stopPropagation()
+  }
 
   useEffect(() => {
     const onKey = e => {
       if (e.key !== 'Escape' || e.isComposing) return
+      if (document.querySelector('[data-slot="dropdown-menu-content"]')) return // the host's menu closes on its own Esc
       e.preventDefault()
       e.stopPropagation()
-      closeRef.current()
+      if (menuOpen.current) setMenu(null) // Esc closes the menu first, the viewer next
+      else closeRef.current()
     }
     window.addEventListener('keydown', onKey, true)
     inputRef.current?.focus()
@@ -2410,7 +2526,9 @@ function SessionModal({ board, ctx, item: liveItem }) {
   const row = (k, v) => (v || v === 0 ? h('div', { className: 'hb-kv' }, h('span', null, k), h('b', null, v)) : null)
 
   return h('div', { className: 'hb-modal-backdrop hb-viewer-backdrop', onMouseDown: e => e.target === e.currentTarget && close() },
-    h('div', { className: `hb-viewer${side ? ' hb-with-side' : ''}${resizing ? ' hb-resizing' : ''}`, style: { width: clampWidth(width) }, role: 'dialog', 'aria-modal': true, 'aria-label': item.title },
+    h('div', { className: `hb-viewer${side ? ' hb-with-side' : ''}${resizing ? ' hb-resizing' : ''}`, style: { width: clampWidth(width) }, role: 'dialog', 'aria-modal': true, 'aria-label': item.title, onContextMenu: openMenu,
+      // Hermes' app-wide right-click menu portals into the enclosing dialog-content, i.e. above this modal.
+      'data-slot': 'dialog-content' },
       handle(-1),
       handle(1),
       h('header', { className: 'hb-vbar' },
@@ -2488,7 +2606,9 @@ function SessionModal({ board, ctx, item: liveItem }) {
             row('Started', item.startedAt ? new Date(item.startedAt).toLocaleString() : null),
             row('Source', item.source),
             h('div', { className: 'hb-kv' }, h('span', null, 'Session id'),
-              h('button', { className: 'hb-idbtn', title: 'Copy session id', onClick: () => copyText(item.key) }, h('code', null, item.key), h(Icon, { name: 'copy', size: 11 }))))))))
+              h('button', { className: 'hb-idbtn', title: 'Copy session id', onClick: () => copyText(item.key) }, h('code', null, item.key), h(Icon, { name: 'copy', size: 11 }))))))),
+    // Outside the viewer: its open animation's transform would offset a fixed-position menu.
+    menu && h(ContextMenu, { menu, onClose: closeMenu }))
 }
 
 
