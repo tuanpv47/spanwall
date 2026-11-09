@@ -1050,6 +1050,7 @@ const CSS = `
 .hb-meta-end{margin-left:auto;display:inline-flex;justify-content:flex-end;min-width:0;max-width:48%}
 .hb-meta-end .hb-ptag{max-width:100%}
 .hb-preview{color:var(--hb-fg2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.hb-preview .hb-who{font-weight:600;color:var(--hb-fg)}
 .hb-card.hb-running .hb-preview{line-height:1.45;height:2.9em} /* live tool text changes length; keep the card height fixed */
 .hb-meta{display:flex;align-items:center;gap:8px;color:var(--hb-fg3);font-size:12px;flex-wrap:nowrap;min-width:0}
 .hb-meta>.hb-state{flex:none;white-space:nowrap}
@@ -1952,8 +1953,10 @@ function cardPreview(item) {
   const t = item.turn
   if (item.column === 'needs') return requestSummary(item.requests[0])
   if (item.column === 'running') {
+    // Who is working and on what — not the raw stream, which churns too fast to read on a card.
     const cur = t?.activity.filter(a => a.kind === 'tool' && !a.done).at(-1)
-    return cur?.label || t?.statusText || (t?.stream ? oneLine(t.stream.slice(-240)) : item.preview)
+    const phase = cur ? `Running ${cur.label}` : t?.statusText || (t?.stream ? 'Writing a reply…' : 'Thinking…')
+    return h(Fragment, null, h('span', { className: 'hb-who' }, item.profileLabel || 'Hermes'), ` · ${phase}`)
   }
   if (item.column === 'failed') return t?.error || item.preview
   if (item.column === 'done') return oneLine(t?.text || item.preview)
