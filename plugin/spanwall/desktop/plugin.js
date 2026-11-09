@@ -1049,14 +1049,12 @@ const CSS = `
 .hb-ext:hover{color:var(--hb-fg);background:color-mix(in srgb,currentColor 8%,transparent)}
 .hb-meta-end{margin-left:auto;display:inline-flex;justify-content:flex-end;min-width:0;max-width:48%}
 .hb-meta-end .hb-ptag{max-width:100%}
-.hb-cardstats{display:flex;align-items:center;gap:12px;color:var(--hb-fg4);font-size:11.5px;margin-top:-3px}
-.hb-cardstats .hb-m{display:inline-flex;align-items:center;gap:4px}
 .hb-preview{color:var(--hb-fg2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
 .hb-card.hb-running .hb-preview{line-height:1.45;height:2.9em} /* live tool text changes length; keep the card height fixed */
 .hb-meta{display:flex;align-items:center;gap:8px;color:var(--hb-fg3);font-size:12px;flex-wrap:nowrap;min-width:0}
 .hb-meta>.hb-state{flex:none;white-space:nowrap}
 .hb-meta>.hb-meta-end{flex:0 1 auto;min-width:22px}
-.hb-meta .hb-m{display:inline-flex;align-items:center;gap:4px}
+.hb-meta .hb-m{flex:none;display:inline-flex;align-items:center;gap:4px;color:var(--hb-fg4);font-size:11.5px}
 .hb-state{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--hb-fg2)}
 .hb-dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
 .hb-spin{width:11px;height:11px;border-radius:50%;border:1.6px solid color-mix(in srgb,var(--hb-run) 30%,transparent);border-top-color:var(--hb-run);animation:hb-spin .9s linear infinite;display:inline-block}
@@ -1332,7 +1330,6 @@ function injectStyles(ctx) {
 const ICONS = {
   sparkle: 'M8 1.5l1.4 4.1L13.5 7 9.4 8.4 8 12.5 6.6 8.4 2.5 7l4.1-1.4z',
   warn: 'M8 2l6.5 11.5h-13zM8 6.5v3.2M8 11.6v.2',
-  wrench: 'M10.2 2.3a3.2 3.2 0 00-3.9 4.1L2.3 10.4a1.3 1.3 0 001.8 1.8l4-4a3.2 3.2 0 004.1-3.9L10.4 6.1 8.9 5.6l-.5-1.5z',
   chat: 'M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z',
   ext: 'M9.5 2.5h4v4M13.5 2.5L7.5 8.5M11.5 9.5v3.5h-9v-9H6',
   board: 'M2.5 3h3v10h-3zM6.5 3h3v6h-3zM10.5 3h3v8h-3z',
@@ -1964,7 +1961,6 @@ function cardPreview(item) {
 }
 
 function Card({ item, board, now, multiProfile, open, onToggle }) {
-  const tools = item.turn?.tools || 0
   const header = h('div', { className: 'hb-cardhead', onClick: onToggle, role: 'button', 'aria-expanded': open, tabIndex: 0, onKeyDown: e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), onToggle()) },
     h('span', { className: `hb-c-${item.column}`, style: { marginTop: 2 } }, h(Icon, { name: 'sparkle', size: 13, fill: true })),
     h('span', { className: 'hb-title' },
@@ -1980,13 +1976,11 @@ function Card({ item, board, now, multiProfile, open, onToggle }) {
   return h('article', { className: `hb-card${open ? ' hb-sel' : ''}${item.column === 'running' ? ' hb-running' : ''}`, 'data-card-id': item.id, 'data-col': item.column },
     header,
     h('div', { className: 'hb-preview' }, cardPreview(item) || h('span', { style: { color: 'var(--hb-fg4)' } }, 'No preview')),
-    // Footer: two fixed lines so every card keeps the same shape whatever the profile name's length.
+    // Footer: one fixed line so every card keeps the same shape whatever the profile name's length.
     h('div', { className: 'hb-meta' },
       h(StatusLine, { item, now }),
+      item.messageCount != null && h('span', { className: 'hb-m', title: 'Messages' }, h(Icon, { name: 'chat', size: 12 }), item.messageCount),
       multiProfile && h('span', { className: 'hb-meta-end' }, h(ProfileTag, { item }))),
-    h('div', { className: 'hb-cardstats' },
-      h('span', { className: 'hb-m', title: 'Messages' }, h(Icon, { name: 'chat', size: 12 }), item.messageCount),
-      h('span', { className: 'hb-m', title: 'Tool calls (current / last turn)' }, h(Icon, { name: 'wrench', size: 12 }), tools)),
     open && h(CardBody, { item, board, now }))
 }
 
