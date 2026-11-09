@@ -112,6 +112,11 @@ Logs: `hermes logs gui -f`.
 The wall polls every watched profile every 3 seconds, which may start that profile's backend.
 Untick the profiles you don't need.
 
+SpanWall keeps UI preferences and a 24-hour archive of finished turns (title, profile, model, tools
+used, the error message if any, the first 600 characters of the reply) in the Desktop's plugin
+storage, so the Done and Failed columns survive a reload. Full disclosure:
+[plugin/spanwall/README.md](plugin/spanwall/README.md#disclosure).
+
 ## Gateway API
 
 Profiles come from `host.profileRoutes()`. Every RPC for a session goes through
@@ -136,6 +141,7 @@ Profiles come from `host.profileRoutes()`. Every RPC for a session goes through
 spanwall/
 ├── plugin/spanwall/
 │   ├── plugin.yaml
+│   ├── README.md          (shown on the catalog page)
 │   └── desktop/plugin.js
 ├── scripts/install.ps1
 ├── assets/
