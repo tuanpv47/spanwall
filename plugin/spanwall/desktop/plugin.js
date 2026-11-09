@@ -36,6 +36,7 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const ACTIVITY_LIMIT = 40
 const STREAM_LIMIT = 4000
 const RUNNING_GRACE_MS = 8000
+const TOMBSTONE_MS = 120000 // upper bound: a deleted card stays hidden at most this long
 
 const COLUMNS = [
   { key: 'needs', label: 'Needs you', hint: 'approval · clarify · sudo / secret' },
@@ -126,6 +127,7 @@ function createBoard(ctx) {
     pinnedOwner: new Map(), // session id → route key for sessions this board created (before their DB row exists)
     models: new Map(), // route key → model.options summary for the new-task form
     compose: null, // { routeKey } while the new-task form is open
+    draft: null, // the new-task form's fields when it was closed without creating (restored on reopen)
     viewing: null, // item id shown in the session viewer modal
     viewingKey: null, // its stored key (follows the session when a resume makes it live)
     transcript: new Map(), // item id → { messages, loading, error, stale, loadedAt } for the viewer and the card chat
@@ -137,7 +139,7 @@ function createBoard(ctx) {
     seq: new Map(), // uid → events watermark for session.events.since
     rawIndex: new Map(), // runtime id → uid (gateway events carry only the runtime id)
     archive: readArchive(), // uid → finished turn summary (survives reloads, 24h)
-    deleted: new Map(), // session id (stored or runtime) → deletedAt: keeps an in-flight poll from bringing it back
+    deleted: new Map(), // session id (stored or runtime) → { at, routeKey }: keeps an in-flight poll from bringing it back
     connected: true,
     lastError: null
   }
@@ -479,10 +481,12 @@ function createBoard(ctx) {
   // owner of a live row — a backend shared by several profiles returns the SAME active_list to every
   // route, with no profile on the rows — and fill the board for profiles with nothing loaded.
   let storedAt = 0
+  let storedStartedAt = 0 // when the last completed refresh started
   let storedRefreshing = null
   function refreshStored(watched, force = false) {
     if (storedRefreshing) return storedRefreshing
     if (!force && Date.now() - storedAt < STORED_EVERY_MS) return Promise.resolve()
+    const startedAt = Date.now()
     storedRefreshing = (async () => {
       const results = await Promise.allSettled(watched.map(r => rpc(r.route, 'session.list', { limit: STORED_LIST_LIMIT, profile: backendProfile(r) }, false)))
       const owner = new Map()
@@ -498,6 +502,7 @@ function createBoard(ctx) {
       })
       state.owner = owner
       storedAt = Date.now()
+      storedStartedAt = startedAt
     })().finally(() => {
       storedRefreshing = null
     })
@@ -510,6 +515,7 @@ function createBoard(ctx) {
   async function poll() {
     if (polling) return
     polling = true
+    const startedAt = Date.now()
     try {
       if (!state.routes.length || Date.now() - routesAt > ROUTES_EVERY_MS) {
         const next = await loadRoutes()
@@ -572,6 +578,7 @@ function createBoard(ctx) {
       if (usageDue) lastUsageAt = Date.now()
       await Promise.all([...due.map(s => syncRequests(s._uid)), ...(usageDue ? rows.map(s => fetchUsage(s._uid)) : [])])
 
+      if (state.deleted.size) pruneDeleted(startedAt, okRoutes)
       state.connected = okRoutes.size > 0 || watched.length === 0
       state.lastError = state.connected ? null : watched[0]?.error || 'gateway unavailable'
     } catch (err) {
@@ -717,10 +724,17 @@ function createBoard(ctx) {
   // Delete a session for good (its stored row + transcripts). The backend refuses a session that is
   // live in it, so a live one is stopped (releasing any approval / clarify wait) and closed first —
   // the order Hermes' own sidebar uses. Throws; the caller shows the error.
+  // Resolves to 'deleted', 'already' (Hermes no longer lists it) or 'local' (it never had a stored
+  // row: only the card goes).
   async function remove(item) {
     const route = routeOf(item.routeKey)
     if (!route) throw new Error('The profile that owns this session is not connected')
     const gone = err => /not found|unknown session|4001|4007/i.test(`${errorText(err)} ${err?.code ?? ''}`)
+    // The stored id is the only thing session.delete knows. A live session has one once it wrote a
+    // row; a closed card's archive record falls back to its uid when it never had one.
+    const storedId = item.stored ? item.key
+      : item.live ? state.sessions.get(item.id)?.session_key || (state.owner.has(item.rawId) ? item.rawId : null)
+      : item.key && item.key !== item.id ? item.key : null
     if (item.live) {
       if (item.column === 'running' || item.requests.length) {
         await sessionRpc(item.id, 'session.interrupt').catch(err => {
@@ -729,18 +743,58 @@ function createBoard(ctx) {
       }
       await sessionRpc(item.id, 'session.close').catch(() => {})
     }
-    try {
-      await rpc(route.route, 'session.delete', { session_id: item.key, profile: backendProfile(route) }, true)
-    } catch (err) {
-      if (!gone(err)) throw err // already gone (a live session that never wrote a row): nothing to delete
+    const target = storedId || (item.live ? item.rawId : null)
+    let outcome = target ? 'deleted' : 'local'
+    if (target) {
+      try {
+        await rpc(route.route, 'session.delete', { session_id: target, profile: backendProfile(route) }, true)
+      } catch (err) {
+        if (!gone(err)) throw err
+        // A live session that never wrote a row has nothing to delete. A known stored id that comes
+        // back "not found" is only taken as deleted once the session lists agree.
+        outcome = storedId ? await confirmGone(storedId, route) : 'local'
+      }
     }
     forget(item)
+    return outcome
+  }
+
+  async function confirmGone(id, route) {
+    const watched = state.routes.filter(r => !state.hidden.has(r.key))
+    await refreshStored(watched) // let a list already in flight (from before the delete) finish
+    await refreshStored(watched, true)
+    const owner = state.owner.get(id)
+    if (owner) {
+      const where = owner === route.key ? '' : ` (it is listed under ${routeOf(owner)?.label || owner})`
+      throw new Error(`Hermes could not find it on ${route.label}, but it is still stored${where}. Nothing was deleted.`)
+    }
+    if (state.stored.get(route.key)?.error) {
+      throw new Error(`Hermes could not find it on ${route.label} and the session list could not be checked. It may not have been deleted.`)
+    }
+    return 'already'
+  }
+
+  // Tombstones keep an in-flight poll from bringing a deleted card back. A runtime id is only unique
+  // within its backend, so it is scoped to the route; a stored id is not.
+  function tombstoned(id, routeKey, now) {
+    const d = id && state.deleted.get(id)
+    return Boolean(d) && now - d.at < TOMBSTONE_MS && (!d.routeKey || d.routeKey === routeKey)
+  }
+
+  // A poll that started after the delete no longer lists the session, and a session.list that
+  // started after it no longer has the row: past that point the tombstone only hides id reuse.
+  function pruneDeleted(pollStartedAt, okRoutes) {
+    const now = Date.now()
+    for (const [id, d] of state.deleted) {
+      const settled = d.routeKey ? d.at < pollStartedAt && okRoutes.has(d.routeKey) : d.at < storedStartedAt
+      if (settled || now - d.at >= TOMBSTONE_MS) state.deleted.delete(id)
+    }
   }
 
   function forget(item) {
     const at = Date.now()
-    for (const [id, t] of state.deleted) if (at - t > 120000) state.deleted.delete(id)
-    for (const id of [item.key, item.rawId]) if (id) state.deleted.set(id, at)
+    if (item.rawId) state.deleted.set(item.rawId, { at, routeKey: item.stored ? null : item.routeKey })
+    if (item.key && item.key !== item.rawId && item.key !== item.id) state.deleted.set(item.key, { at, routeKey: null })
     for (const [uid, s] of state.sessions) if (uid === item.id || s.session_key === item.key) dropSession(uid)
     for (const [uid, rec] of state.archive) {
       if (uid !== item.id && rec.key !== item.key) continue
@@ -911,7 +965,9 @@ function createBoard(ctx) {
         }
       }
     }
-    return state.deleted.size ? out.filter(i => !state.deleted.has(i.key) && !state.deleted.has(i.rawId)) : out
+    if (!state.deleted.size) return out
+    const now = Date.now()
+    return out.filter(i => !tombstoned(i.key, i.routeKey, now) && !tombstoned(i.rawId, i.routeKey, now))
   }
 
   function refresh() {
@@ -1641,14 +1697,19 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
     const remembered = readStored(ctx, 'lastTaskProfile', null)
     return [initialRouteKey, remembered].find(k => k && routes.some(r => r.key === k)) || routes.find(r => r.active)?.key || routes[0]?.key || ''
   }
-  const [routeKey, setRouteKey] = useState(pickDefault)
-  const [prompt, setPrompt] = useState('')
-  const [title, setTitle] = useState('')
+  // Every way of closing (Esc, backdrop, ×, the toolbar button) keeps an unsent draft for next time.
+  const [draft] = useState(() => {
+    const d = board.state.draft
+    return d && routes.some(r => r.key === d.routeKey) ? d : null
+  })
+  const [routeKey, setRouteKey] = useState(() => draft?.routeKey || pickDefault())
+  const [prompt, setPrompt] = useState(draft?.prompt || '')
+  const [title, setTitle] = useState(draft?.title || '')
   const [advanced, setAdvanced] = useState(() => readStored(ctx, 'taskAdvancedOpen', false))
-  const [modelSel, setModelSel] = useState('')
-  const [effort, setEffort] = useState('')
-  const [fast, setFast] = useState('')
-  const [cwd, setCwd] = useState('')
+  const [modelSel, setModelSel] = useState(draft?.modelSel || '')
+  const [effort, setEffort] = useState(draft?.effort || '')
+  const [fast, setFast] = useState(draft?.fast || '')
+  const [cwd, setCwd] = useState(draft?.cwd || '')
   const [openAfter, setOpenAfter] = useState(() => readStored(ctx, 'taskOpenAfter', false))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
@@ -1660,14 +1721,43 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
   useEffect(() => {
     if (routeKey) void board.loadModels(routeKey)
   }, [routeKey, board])
+  // A restored draft opens with the caret at its end (typing continues it) and the box sized to fit.
   useEffect(() => {
-    promptRef.current?.focus()
+    const el = promptRef.current
+    if (!el) return
+    el.focus()
+    const end = el.value.length
+    el.setSelectionRange(end, end)
+    if (end) {
+      el.style.height = `${Math.min(el.scrollHeight, 260)}px`
+      el.scrollTop = el.scrollHeight
+    }
   }, [])
   // A model list belongs to one profile: switching profile resets the pick.
-  useEffect(() => setModelSel(''), [routeKey])
+  const pickRoute = k => {
+    if (k !== routeKey) setModelSel('')
+    setRouteKey(k)
+  }
 
   const [provider, model] = modelSel ? modelSel.split('\u0000') : ['', '']
   const caps = model ? models?.providers?.find(p => p.slug === provider)?.capabilities?.[model] : null
+  // A model without the knob gets the default, not what was picked for the previous model.
+  const noReasoning = Boolean(caps && caps.reasoning === false)
+  const noFast = Boolean(caps && !caps.fast)
+  useEffect(() => {
+    if (noReasoning) setEffort('')
+  }, [noReasoning])
+  useEffect(() => {
+    if (noFast) setFast('')
+  }, [noFast])
+
+  const created = useRef(false)
+  const fieldsRef = useRef(null)
+  fieldsRef.current = { routeKey, prompt, title, modelSel, effort, fast, cwd }
+  useEffect(() => () => {
+    const f = fieldsRef.current
+    board.state.draft = created.current || !(f.prompt.trim() || f.title.trim() || f.cwd.trim()) ? null : f
+  }, [board])
   const close = () => !busy && board.closeComposer()
   const empty = !prompt.trim()
   const [attempted, setAttempted] = useState(false)
@@ -1702,7 +1792,12 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
     setBusy(true)
     setError(null)
     try {
-      await board.createSession(routeKey, { prompt, title, model, provider, reasoningEffort: effort, fast, cwd, openAfter, idempotencyKey: idem.current })
+      await board.createSession(routeKey, {
+        prompt, title, model, provider, cwd, openAfter, idempotencyKey: idem.current,
+        reasoningEffort: noReasoning ? '' : effort,
+        fast: noFast ? '' : fast
+      })
+      created.current = true
       writeStored(ctx, 'lastTaskProfile', routeKey)
       writeStored(ctx, 'taskOpenAfter', openAfter)
       host.notify({ kind: 'success', message: `Session created on profile ${route?.label || routeKey}` })
@@ -1732,7 +1827,7 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
     }))
   }]
 
-  return h('div', { className: 'hb-modal-backdrop', onMouseDown: e => e.target === e.currentTarget && !prompt.trim() && close() },
+  return h('div', { className: 'hb-modal-backdrop', onMouseDown: e => e.target === e.currentTarget && close() },
     h('div', { className: 'hb-modal hb-taskmodal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'hb-modal-title' },
       h('div', { className: 'hb-modal-head' },
         h('div', { id: 'hb-modal-title', className: 'hb-modal-title' }, 'New task'),
@@ -1764,7 +1859,7 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
             h(Combo, {
               variant: 'pill', searchable: routes.length > 6, minPopWidth: 220,
               escapeRef: comboEscape,
-              value: routeKey, onChange: setRouteKey, disabled: busy,
+              value: routeKey, onChange: pickRoute, disabled: busy,
               groups: profileGroups, placeholder: 'Search profiles…', title: 'Profile to run the task'
             }),
             h(Combo, {
@@ -1782,7 +1877,7 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
               busy ? h('span', { className: 'hb-spin hb-spin-light' }) : h(Icon, { name: 'arrowUp', size: 16 })))),
         attempted && empty
           ? h('div', { id: 'hb-prompt-err', className: 'hb-field-err', role: 'alert' }, 'Enter a task prompt before creating it.')
-          : h('div', { className: 'hb-tbox-hint' }, 'Enter to create · Shift+Enter for a new line · Esc to close'),
+          : h('div', { className: 'hb-tbox-hint' }, 'Enter to create · Shift+Enter for a new line · Esc to close (the draft is kept)'),
 
         advanced && h('div', { className: 'hb-adv' },
           h('div', { className: 'hb-adv-grid' },
@@ -1794,11 +1889,11 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
               h('input', { className: 'hb-field-input hb-mono', value: cwd, disabled: busy, placeholder: "profile's terminal.cwd", onChange: e => setCwd(e.target.value) }))),
           h('div', { className: 'hb-section' },
             h('div', { className: 'hb-flabel' }, 'Reasoning effort', caps && caps.reasoning === false && h('span', { className: 'hb-flabel-note' }, ' · not supported by this model')),
-            h(Segmented, { value: effort, onChange: setEffort, disabled: busy || (caps && caps.reasoning === false),
+            h(Segmented, { value: noReasoning ? '' : effort, onChange: setEffort, disabled: busy || noReasoning,
               options: [{ value: '', label: 'Default' }, ...EFFORTS.map(x => ({ value: x, label: x }))] })),
           h('div', { className: 'hb-section' },
             h('div', { className: 'hb-flabel' }, 'Fast mode', caps && !caps.fast && h('span', { className: 'hb-flabel-note' }, ' · this model has no fast tier')),
-            h(Segmented, { value: fast, onChange: setFast, disabled: busy || (caps && !caps.fast),
+            h(Segmented, { value: noFast ? '' : fast, onChange: setFast, disabled: busy || noFast,
               options: [{ value: '', label: 'Default' }, { value: 'on', label: 'On' }, { value: 'off', label: 'Off' }] })),
           h('label', { className: 'hb-switch-row' },
             h('span', { className: `hb-switch${openAfter ? ' hb-on' : ''}` },
@@ -2070,8 +2165,8 @@ function DeleteDialog({ board, item, onClose }) {
     setBusy(true)
     setError(null)
     try {
-      await board.remove(item)
-      host.notify({ kind: 'info', message: 'Session deleted' })
+      const outcome = await board.remove(item)
+      host.notify({ kind: 'info', message: outcome === 'already' ? 'Session was already deleted' : outcome === 'local' ? 'Removed from the board (Hermes had not stored this session)' : 'Session deleted' })
       onClose()
     } catch (err) {
       setError(errorText(err))
