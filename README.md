@@ -39,7 +39,7 @@ From a card:
 
 Also:
 
-- **Profiles**: filter chips per profile, a profile tag on every card, and a text filter.
+- **Profiles**: filter chips per profile (pick one or several at once), a profile tag on every card, and a text filter.
 - **+ New task**: create a session on any profile with its first prompt. Advanced options: model,
   reasoning effort, fast mode, working directory and title.
 - **Status bar**: how many requests are waiting for you; click to open the wall.

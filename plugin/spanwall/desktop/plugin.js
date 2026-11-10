@@ -36,6 +36,8 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const ACTIVITY_LIMIT = 40
 const STREAM_LIMIT = 4000
 const RUNNING_GRACE_MS = 8000
+const TAIL_LIMIT = 20
+const TAIL_GIVE_UP_MS = 60000
 const TOMBSTONE_MS = 120000 // upper bound: a deleted card stays hidden at most this long
 
 const COLUMNS = [
@@ -80,12 +82,24 @@ const clip = (text, n) => {
 }
 
 const oneLine = text => clip(text, 400).replace(/\s+/g, ' ').trim()
-// The running reply not yet in the transcript: the current message, plus earlier ones of the turn
-// until a transcript fetched after they were written to the session DB shows them.
-const liveReply = (t, tr) => {
-  if (!t) return ''
-  const held = t.held && !(tr?.fetchedAt > t.heldAt) ? t.held : ''
-  return held && t.pending ? `${held}\n\n${t.pending}` : held || t.pending || ''
+
+// The board's tail entries (see pushTail) this transcript does not show yet. A written message is
+// gone from the tail once a transcript fetched after it exists, or as soon as one carries its text
+// (a fetch sent just before the write may still return it). The rest gives up after a minute.
+const squash = s => String(s || '').replace(/\s+/g, ' ').trim()
+const unseenTail = (entries, tr, running) => {
+  if (!entries?.length) return []
+  if (!tr?.fetchedAt) return entries
+  const recent = { user: [], assistant: [] }
+  for (const m of (tr.messages || []).slice(-12)) recent[m.role]?.push(squash(m.text))
+  return entries.filter(e => {
+    if (e.written && tr.fetchedAt > e.at) return false
+    if (tr.fetchedAt - e.at > TAIL_GIVE_UP_MS) return false
+    // Sealed by a redirect: Hermes may keep or drop that partial text; the transcript after the turn decides.
+    if (e.role === 'assistant' && !e.written && !running && tr.fetchedAt > e.at) return false
+    const text = squash(e.text)
+    return !recent[e.role]?.some(m => m.includes(text))
+  })
 }
 
 const errorText = err => (err && (err.message || err.error?.message)) || String(err || 'Unknown error')
@@ -135,6 +149,8 @@ function createBoard(ctx) {
     models: new Map(), // route key → model.options summary for the new-task form
     compose: null, // { routeKey } while the new-task form is open
     draft: null, // the new-task form's fields when it was closed without creating (restored on reopen)
+    chatDrafts: new Map(), // session key → unsent text of the viewer / card chat
+    tail: new Map(), // uid → [{ role, text, at, written }] shown after the transcript until it carries them
     viewing: null, // item id shown in the session viewer modal
     viewingKey: null, // its stored key (follows the session when a resume makes it live)
     transcript: new Map(), // item id → { messages, loading, error, stale, loadedAt } for the viewer and the card chat
@@ -255,6 +271,7 @@ function createBoard(ctx) {
     state.seq.delete(uid)
     state.usage.delete(uid)
     state.transcript.delete(uid)
+    state.tail.delete(uid)
     if (!state.archive.has(uid)) state.turns.delete(uid)
   }
 
@@ -265,8 +282,8 @@ function createBoard(ctx) {
     if (!t) {
       const rec = state.archive.get(uid)
       t = rec
-        ? { status: rec.status, startedAt: rec.startedAt || 0, endedAt: rec.endedAt, tools: rec.tools || 0, activity: [], stream: '', pending: '', held: '', heldAt: 0, text: rec.text || '', error: rec.error || null, statusText: '', dismissedAt: rec.dismissedAt || 0 }
-        : { status: 'none', startedAt: 0, endedAt: 0, tools: 0, activity: [], stream: '', pending: '', held: '', heldAt: 0, text: '', error: null, statusText: '', dismissedAt: 0 }
+        ? { status: rec.status, startedAt: rec.startedAt || 0, endedAt: rec.endedAt, tools: rec.tools || 0, activity: [], stream: '', pending: '', text: rec.text || '', error: rec.error || null, statusText: '', dismissedAt: rec.dismissedAt || 0 }
+        : { status: 'none', startedAt: 0, endedAt: 0, tools: 0, activity: [], stream: '', pending: '', text: '', error: null, statusText: '', dismissedAt: 0 }
       state.turns.set(uid, t)
     }
     return t
@@ -275,7 +292,7 @@ function createBoard(ctx) {
   function startTurn(uid, turnId, startedAt = Date.now()) {
     const t = turn(uid)
     if (t.status === 'running' && (!turnId || t.turnId === turnId)) return t
-    Object.assign(t, { status: 'running', turnId: turnId || null, startedAt, endedAt: 0, tools: 0, stream: '', pending: '', held: '', heldAt: 0, text: '', error: null, statusText: '' })
+    Object.assign(t, { status: 'running', turnId: turnId || null, startedAt, endedAt: 0, tools: 0, stream: '', pending: '', text: '', error: null, statusText: '' })
     t.activity = t.activity.filter(a => a.kind === 'user' && Date.now() - a.at < 5000) // keep the prompt we just sent
     return t
   }
@@ -311,17 +328,27 @@ function createBoard(ctx) {
     markTranscriptStale(uid) // refetched by whoever shows it
   }
 
-  // Hermes writes each assistant message to the session DB before its tools run, and only then emits
-  // message.interim / tool.start: from here on session.history carries the text streamed so far.
-  // `held` keeps it on screen until a transcript fetched after this point replaces it.
-  function closeSegment(uid, t) {
+  // Text shown after the transcript until session.history carries it (unseenTail): finished assistant
+  // messages and what the user just sent, so nothing blinks out while the transcript reloads.
+  function pushTail(uid, entry) {
+    const e = { at: Date.now(), written: false, ...entry }
+    state.tail.set(uid, [...(state.tail.get(uid) || []), e].slice(-TAIL_LIMIT))
+    return e
+  }
+
+  function dropTail(uid, e) {
+    const left = (state.tail.get(uid) || []).filter(x => x !== e)
+    left.length ? state.tail.set(uid, left) : state.tail.delete(uid)
+  }
+
+  // Hermes writes each assistant message to the session DB before its tools run (and the final one
+  // before message.complete), and only then emits message.interim / tool.start / message.complete:
+  // from here on session.history carries the text streamed so far.
+  function closeSegment(uid, t, written = true) {
     markTranscriptStale(uid)
-    if (!t.pending) return
-    const tr = state.transcript.get(uid)
-    const held = tr?.fetchedAt > t.heldAt ? '' : t.held
-    t.held = held ? `${held}\n\n${t.pending}` : t.pending
+    if (!t.pending.trim()) return
+    pushTail(uid, { role: 'assistant', text: t.pending, written })
     t.pending = ''
-    t.heldAt = Date.now()
   }
 
   function mergeUsage(uid, usage) {
@@ -423,6 +450,8 @@ function createBoard(ctx) {
         const t = turn(uid)
         const status = p.status === 'error' ? 'error' : p.status === 'interrupted' ? 'interrupted' : 'complete'
         if (p.usage) mergeUsage(uid, p.usage)
+        if (!t.pending && typeof p.text === 'string') t.pending = p.text // not streamed
+        closeSegment(uid, t)
         endTurn(uid, status, {
           text: typeof p.text === 'string' && p.text ? p.text : t.stream,
           error: status === 'error' ? p.error || p.failure_reason || 'Turn failed' : null
@@ -644,15 +673,36 @@ function createBoard(ctx) {
     const body = text.trim()
     if (!body) return false
     const running = isRunning(uid)
+    // Shown right away, below what has streamed so far; the rest of the reply goes below it.
+    if (running) closeSegment(uid, turn(uid), false)
+    const mine = pushTail(uid, { role: 'user', text: body })
+    emit()
     try {
-      await sessionRpc(uid, running ? 'session.steer' : 'prompt.submit', { text: body })
+      let status = ''
+      if (running) {
+        // Like Hermes Desktop's composer: redirect the live turn (queued as the next turn while it is
+        // still being built) and keep it as a real user message. session.steer is a hidden note that
+        // never shows up in the transcript and waits for the next tool result.
+        try {
+          status = (await sessionRpc(uid, 'session.redirect', { text: body }))?.status || ''
+        } catch (err) {
+          if (!/4010|not support/i.test(`${errorText(err)} ${err?.code ?? ''}`)) throw err
+        }
+      }
+      if (status !== 'redirected' && status !== 'queued') {
+        // Idle, the turn ended meanwhile (rejected), or no redirect support: the gateway's busy policy decides.
+        status = (await sessionRpc(uid, 'prompt.submit', { text: body }))?.status || ''
+      }
       const t = running ? turn(uid) : startTurn(uid)
-      pushActivity(t, { kind: 'user', label: running ? `Steer: ${oneLine(body)}` : `You: ${oneLine(body)}`, done: true })
+      pushActivity(t, { kind: 'user', label: `You: ${oneLine(body)}`, done: true })
+      if (status === 'queued') host.notify({ kind: 'info', message: 'Queued — it runs when the current turn finishes.' })
       markTranscriptStale(uid)
       emit()
       pollSoon(600)
       return true
     } catch (err) {
+      dropTail(uid, mine)
+      emit()
       host.notifyError(err, 'Could not send the message')
       return false
     }
@@ -1640,15 +1690,23 @@ function BoardPage({ board, ctx }) {
 
   const all = board.items(busyBySession)
   const routes = board.state.routes.filter(r => !board.state.hidden.has(r.key))
-  const filterKey = routes.some(r => r.key === profileFilter) ? profileFilter : null
+  // Several profiles can be picked at once; an empty selection means all of them. Older builds
+  // stored a single key, so a string is read as a one-profile selection.
+  const stored = Array.isArray(profileFilter) ? profileFilter : profileFilter ? [profileFilter] : []
+  const filterKeys = routes.filter(r => stored.includes(r.key)).map(r => r.key)
+  const filterSet = new Set(filterKeys)
+  // The one picked profile, if exactly one is: New task opens on it.
+  const filterKey = filterKeys.length === 1 ? filterKeys[0] : null
   const pickProfile = key => {
-    const next = key === filterKey ? null : key
-    setProfileFilter(next)
-    writeStored(ctx, 'profileFilter', next)
+    const next = key == null ? [] : filterSet.has(key) ? filterKeys.filter(k => k !== key) : [...filterKeys, key]
+    // Picking every profile is the same as picking none.
+    const value = next.length === routes.length ? [] : next
+    setProfileFilter(value)
+    writeStored(ctx, 'profileFilter', value)
   }
   const q = query.trim().toLowerCase()
   const matching = q ? all.filter(i => `${i.title} ${i.preview} ${i.model} ${i.profileLabel}`.toLowerCase().includes(q)) : all
-  const visible = filterKey ? matching.filter(i => i.routeKey === filterKey) : matching
+  const visible = filterSet.size ? matching.filter(i => filterSet.has(i.routeKey)) : matching
 
   const byCol = Object.fromEntries(COLUMNS.map(c => [c.key, []]))
   for (const it of visible) if (byCol[it.column]) byCol[it.column].push(it)
@@ -1696,7 +1754,7 @@ function BoardPage({ board, ctx }) {
         h('button', { 'aria-pressed': view === 'board', onClick: () => pickView('board') }, h(Icon, { name: 'board' }), 'Board'),
         h('button', { 'aria-pressed': view === 'list', onClick: () => pickView('list') }, h(Icon, { name: 'list' }), 'List'))),
     board.state.lastError && h('div', { className: 'hb-banner' }, `Could not read sessions from the gateway: ${board.state.lastError}`),
-    routes.length > 1 && h(ProfileBar, { items: matching, routes, filterKey, onPick: pickProfile }),
+    routes.length > 1 && h(ProfileBar, { items: matching, routes, filterSet, onPick: pickProfile }),
     board.state.viewing && h(SessionModal, { key: board.state.viewing, board, ctx,
       item: all.find(i => i.live && i.key === board.state.viewingKey) || all.find(i => i.id === board.state.viewing) || null }),
     doomed && h(DeleteDialog, { key: doomed.id, board, item: all.find(i => i.id === doomed.id) || doomed, onClose: () => setDoomed(null) }),
@@ -2081,8 +2139,9 @@ function Combo({ value, onChange, groups, defaultLabel = null, placeholder = 'Se
 }
 
 
-// One chip per profile route: filter on click, with live / needs counts and reachability.
-function ProfileBar({ items, routes, filterKey, onPick }) {
+// One chip per profile route: a click adds or removes it from the filter, with live / needs
+// counts and reachability. "All profiles" clears the selection.
+function ProfileBar({ items, routes, filterSet, onPick }) {
   const stats = list => ({
     cards: list.length,
     live: list.filter(i => i.live).length,
@@ -2092,7 +2151,7 @@ function ProfileBar({ items, routes, filterKey, onPick }) {
   const breakdown = s => `${s.cards} cards: ${s.live} live · ${s.stored} saved · ${s.cards - s.live - s.stored} closed${s.needs ? ` · ${s.needs} need you` : ''}`
   const total = stats(items)
   return h('div', { className: 'hb-profiles', role: 'toolbar', 'aria-label': 'Profiles' },
-    h('button', { className: 'hb-pchip', 'aria-pressed': !filterKey, title: breakdown(total), onClick: () => onPick(null) },
+    h('button', { className: 'hb-pchip', 'aria-pressed': !filterSet.size, title: breakdown(total), onClick: () => onPick(null) },
       'All profiles', h('span', { className: 'hb-pcount' }, total.cards),
       total.needs > 0 && h('span', { className: 'hb-pneeds' }, total.needs)),
     routes.map(r => {
@@ -2100,7 +2159,7 @@ function ProfileBar({ items, routes, filterKey, onPick }) {
       return h('button', {
         key: r.key,
         className: `hb-pchip${r.error ? ' hb-perr' : ''}`,
-        'aria-pressed': filterKey === r.key,
+        'aria-pressed': filterSet.has(r.key),
         title: r.error ? `Unreachable: ${r.error}` : `${r.label}${r.active ? ' (current)' : ''} — ${breakdown(s)}`,
         onClick: () => onPick(r.key)
       },
@@ -2634,7 +2693,7 @@ function SessionModal({ board, ctx, item: liveItem }) {
   if (liveItem) lastItem.current = liveItem
   const item = liveItem || lastItem.current
   const now = useNow(Boolean(item && (item.column === 'running' || item.column === 'needs')), 1000)
-  const [text, setText] = useState('')
+  const [text, setText] = useChatDraft(board, item)
   const [sending, setSending] = useState(false)
   const [side, setSide] = useState(() => readStored(ctx, 'viewerSide', false))
   const [width, setWidth] = useState(() => readStored(ctx, 'viewerWidth', VIEWER_DEFAULT_WIDTH))
@@ -2708,7 +2767,7 @@ function SessionModal({ board, ctx, item: liveItem }) {
       else closeRef.current()
     }
     window.addEventListener('keydown', onKey, true)
-    inputRef.current?.focus()
+    focusAtEnd(inputRef.current, 220)
     return () => window.removeEventListener('keydown', onKey, true)
   }, [])
 
@@ -2724,12 +2783,13 @@ function SessionModal({ board, ctx, item: liveItem }) {
     return () => clearInterval(t)
   }, [item?.id, running, board])
 
-  const stream = running ? liveReply(item?.turn, tr) : ''
+  const stream = running ? item?.turn?.pending || '' : ''
   const messages = tr?.messages || []
+  const tail = item ? unseenTail(board.state.tail.get(item.id), tr, running) : []
   useLayoutEffect(() => {
     const el = scroller.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
-  }, [messages.length, stream.length, tr?.loadedAt, item?.requests?.length])
+  }, [messages.length, tail.length, stream.length, tr?.loadedAt, item?.requests?.length])
   // Content can also grow without a render of ours (code blocks wrapping, a request card opening):
   // follow it while the reader is at the bottom.
   const colRef = useRef(null)
@@ -2790,8 +2850,9 @@ function SessionModal({ board, ctx, item: liveItem }) {
             h('div', { className: 'hb-tcol', ref: colRef },
               tr?.loading && !messages.length && h('div', { className: 'hb-tempty' }, h('span', { className: 'hb-spin' }), 'Loading conversation…'),
               tr?.error && h('div', { className: 'hb-modal-err' }, `Could not load the conversation: ${tr.error}`, h('button', { className: 'hb-btn hb-small', style: { marginLeft: 10 }, onClick: () => void board.loadTranscript(item) }, 'Retry')),
-              !tr?.loading && !tr?.error && !messages.length && !stream && h('div', { className: 'hb-tempty' }, 'No messages yet.'),
+              !tr?.loading && !tr?.error && !messages.length && !tail.length && !stream && h('div', { className: 'hb-tempty' }, 'No messages yet.'),
               messages.map((m, i) => h(TranscriptRow, { key: m.id ?? i, m, item, onExpand: () => { stick.current = false } })),
+              tail.map(e => h(TranscriptRow, { key: `tail-${e.at}-${e.role}`, m: e, item })),
               running && h('div', { className: 'hb-trow hb-trow-assistant' },
                 h('div', { className: 'hb-aname' }, h('span', { className: 'hb-avatar hb-avatar-live' }, h(Icon, { name: 'sparkle', size: 11, fill: true })), 'Hermes',
                   h('span', { className: 'hb-tmeta' }, liveTool ? `running ${liveTool.label}` : t?.statusText || (stream ? 'writing…' : 'thinking…'))),
