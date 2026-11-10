@@ -80,6 +80,13 @@ const clip = (text, n) => {
 }
 
 const oneLine = text => clip(text, 400).replace(/\s+/g, ' ').trim()
+// The running reply not yet in the transcript: the current message, plus earlier ones of the turn
+// until a transcript fetched after they were written to the session DB shows them.
+const liveReply = (t, tr) => {
+  if (!t) return ''
+  const held = t.held && !(tr?.fetchedAt > t.heldAt) ? t.held : ''
+  return held && t.pending ? `${held}\n\n${t.pending}` : held || t.pending || ''
+}
 
 const errorText = err => (err && (err.message || err.error?.message)) || String(err || 'Unknown error')
 
@@ -258,8 +265,8 @@ function createBoard(ctx) {
     if (!t) {
       const rec = state.archive.get(uid)
       t = rec
-        ? { status: rec.status, startedAt: rec.startedAt || 0, endedAt: rec.endedAt, tools: rec.tools || 0, activity: [], stream: '', text: rec.text || '', error: rec.error || null, statusText: '', dismissedAt: rec.dismissedAt || 0 }
-        : { status: 'none', startedAt: 0, endedAt: 0, tools: 0, activity: [], stream: '', text: '', error: null, statusText: '', dismissedAt: 0 }
+        ? { status: rec.status, startedAt: rec.startedAt || 0, endedAt: rec.endedAt, tools: rec.tools || 0, activity: [], stream: '', pending: '', held: '', heldAt: 0, text: rec.text || '', error: rec.error || null, statusText: '', dismissedAt: rec.dismissedAt || 0 }
+        : { status: 'none', startedAt: 0, endedAt: 0, tools: 0, activity: [], stream: '', pending: '', held: '', heldAt: 0, text: '', error: null, statusText: '', dismissedAt: 0 }
       state.turns.set(uid, t)
     }
     return t
@@ -268,7 +275,7 @@ function createBoard(ctx) {
   function startTurn(uid, turnId, startedAt = Date.now()) {
     const t = turn(uid)
     if (t.status === 'running' && (!turnId || t.turnId === turnId)) return t
-    Object.assign(t, { status: 'running', turnId: turnId || null, startedAt, endedAt: 0, tools: 0, stream: '', text: '', error: null, statusText: '' })
+    Object.assign(t, { status: 'running', turnId: turnId || null, startedAt, endedAt: 0, tools: 0, stream: '', pending: '', held: '', heldAt: 0, text: '', error: null, statusText: '' })
     t.activity = t.activity.filter(a => a.kind === 'user' && Date.now() - a.at < 5000) // keep the prompt we just sent
     return t
   }
@@ -302,7 +309,19 @@ function createBoard(ctx) {
       saveArchive()
     }
     markTranscriptStale(uid) // refetched by whoever shows it
+  }
+
+  // Hermes writes each assistant message to the session DB before its tools run, and only then emits
+  // message.interim / tool.start: from here on session.history carries the text streamed so far.
+  // `held` keeps it on screen until a transcript fetched after this point replaces it.
+  function closeSegment(uid, t) {
     markTranscriptStale(uid)
+    if (!t.pending) return
+    const tr = state.transcript.get(uid)
+    const held = tr?.fetchedAt > t.heldAt ? '' : t.held
+    t.held = held ? `${held}\n\n${t.pending}` : t.pending
+    t.pending = ''
+    t.heldAt = Date.now()
   }
 
   function mergeUsage(uid, usage) {
@@ -366,12 +385,20 @@ function createBoard(ctx) {
       case 'message.delta': {
         const t = turn(uid)
         if (t.status !== 'running') startTurn(uid, p.turn_id)
-        if (typeof p.text === 'string') t.stream = (t.stream + p.text).slice(-STREAM_LIMIT)
+        if (typeof p.text === 'string') {
+          t.stream = (t.stream + p.text).slice(-STREAM_LIMIT)
+          t.pending = (t.pending + p.text).slice(-STREAM_LIMIT)
+        }
+        break
+      }
+      case 'message.interim': {
+        closeSegment(uid, turn(uid))
         break
       }
       case 'tool.start': {
         const t = turn(uid)
         if (t.status !== 'running') startTurn(uid)
+        closeSegment(uid, t)
         t.tools++
         pushActivity(t, { kind: 'tool', id: p.tool_id, label: toolLabel(p), done: false })
         break
@@ -402,6 +429,7 @@ function createBoard(ctx) {
         })
         pushActivity(turn(uid), { kind: status === 'error' ? 'error' : 'done', label: status === 'error' ? `Failed — ${oneLine(p.error || p.failure_reason || '')}` : status === 'interrupted' ? 'Interrupted' : 'Turn complete', done: true })
         removeRequest((_, u) => u === uid)
+        pollSoon() // the last poll still says working
         break
       }
       case 'error': {
@@ -461,11 +489,12 @@ function createBoard(ctx) {
 
   // Profiles whose events never reach this window still move between columns: infer turn
   // start / end from the polled status when no event already did.
-  function reconcileStatus(uid, prev, row) {
+  function reconcileStatus(uid, prev, row, polledAt) {
     const wasRunning = prev && RUNNING_STATUSES.has(prev.status)
     const nowRunning = RUNNING_STATUSES.has(row.status)
     const t = state.turns.get(uid)
-    if (nowRunning && t?.status !== 'running') {
+    // A row read before message.complete arrived is not a new turn.
+    if (nowRunning && t?.status !== 'running' && !(t?.endedAt > polledAt)) {
       startTurn(uid, null, prev ? Date.now() : toMs(row.last_active) || Date.now())
     } else if (wasRunning && row.status === 'idle' && t?.status === 'running') {
       endTurn(uid, 'complete', { text: t.stream || row.preview || '' })
@@ -557,8 +586,8 @@ function createBoard(ctx) {
         const uid = `${r.key}|${row.id}`
         const prev = state.sessions.get(uid)
         seen.add(uid)
-        state.sessions.set(uid, { ...row, _uid: uid, _rawId: row.id, _routeKey: r.key, _profile: r.label })
-        reconcileStatus(uid, prev, row)
+        state.sessions.set(uid, { ...row, _uid: uid, _rawId: row.id, _routeKey: r.key, _profile: r.label, _polledAt: startedAt })
+        reconcileStatus(uid, prev, row, startedAt)
       }
       if (unknownOwner && Date.now() - lastOwnerRefresh > 10000) {
         lastOwnerRefresh = Date.now()
@@ -656,6 +685,7 @@ function createBoard(ctx) {
   async function loadTranscript(item) {
     const cur = state.transcript.get(item.id)
     if (cur?.loading) return
+    const fetchedAt = Date.now()
     state.transcript.set(item.id, { messages: [], ...(cur || {}), loading: true, stale: false })
     emitSoon()
     try {
@@ -696,9 +726,11 @@ function createBoard(ctx) {
         }))
         .filter(m => m.role !== 'tool' && m.text.trim()) // tool calls: open the session in Hermes
         .slice(-TRANSCRIPT_LIMIT)
-      state.transcript.set(item.id, { messages, loading: false, error: null, stale: false, loadedAt: Date.now() })
+      // Marked stale while in flight (a turn ended, a message was flushed): this copy may predate it.
+      const stale = Boolean(state.transcript.get(item.id)?.stale)
+      state.transcript.set(item.id, { messages, loading: false, error: null, stale, loadedAt: Date.now(), fetchedAt })
       if (!item.live && r?.session_id && item.routeKey) {
-        state.transcript.set(`${item.routeKey}|${r.session_id}`, { messages, loading: false, error: null, stale: false, loadedAt: Date.now() })
+        state.transcript.set(`${item.routeKey}|${r.session_id}`, { messages, loading: false, error: null, stale: false, loadedAt: Date.now(), fetchedAt })
       }
     } catch (err) {
       state.transcript.set(item.id, { ...(state.transcript.get(item.id) || { messages: [] }), loading: false, error: errorText(err), stale: false, loadedAt: Date.now() })
@@ -837,12 +869,14 @@ function createBoard(ctx) {
   function isRunning(uid, busyBySession) {
     const s = state.sessions.get(uid)
     const route = routeOf(s?._routeKey)
+    const t = state.turns.get(uid)
+    // message.complete outranks a poll taken before it.
+    if (t && t.status !== 'running' && t.endedAt > (s?._polledAt || 0)) return false
     // busyBySession is keyed by runtime id of the window's own gateway — only meaningful for the active profile.
     if (route?.active && s && busyBySession?.[s._rawId]) return true
     if (s && RUNNING_STATUSES.has(s.status)) return true
     // The event stream leads the 3s poll: trust a fresh turn even while the last poll still says idle,
     // but let a stale one (missed message.complete) fall back to the gateway's status.
-    const t = state.turns.get(uid)
     return t?.status === 'running' && (s?.status !== 'idle' || Date.now() - t.startedAt < RUNNING_GRACE_MS)
   }
 
@@ -1735,7 +1769,11 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
   }, [])
   // A model list belongs to one profile: switching profile resets the pick.
   const pickRoute = k => {
-    if (k !== routeKey) setModelSel('')
+    if (k !== routeKey) {
+      setModelSel('')
+      setEffort('') // picked for a model of the previous profile
+      setFast('')
+    }
     setRouteKey(k)
   }
 
@@ -2686,7 +2724,7 @@ function SessionModal({ board, ctx, item: liveItem }) {
     return () => clearInterval(t)
   }, [item?.id, running, board])
 
-  const stream = running ? item?.turn?.stream || '' : ''
+  const stream = running ? liveReply(item?.turn, tr) : ''
   const messages = tr?.messages || []
   useLayoutEffect(() => {
     const el = scroller.current
@@ -2756,7 +2794,7 @@ function SessionModal({ board, ctx, item: liveItem }) {
               messages.map((m, i) => h(TranscriptRow, { key: m.id ?? i, m, item, onExpand: () => { stick.current = false } })),
               running && h('div', { className: 'hb-trow hb-trow-assistant' },
                 h('div', { className: 'hb-aname' }, h('span', { className: 'hb-avatar hb-avatar-live' }, h(Icon, { name: 'sparkle', size: 11, fill: true })), 'Hermes',
-                  h('span', { className: 'hb-tmeta' }, liveTool ? `running ${liveTool.label}` : t?.statusText || 'thinking…')),
+                  h('span', { className: 'hb-tmeta' }, liveTool ? `running ${liveTool.label}` : t?.statusText || (stream ? 'writing…' : 'thinking…'))),
                 h('div', { className: 'hb-abody' }, stream ? h(RichText, { text: stream, item }) : null, h('span', { className: 'hb-caret-blink' }))),
               item.requests.map(req => h('div', { key: req.id, className: 'hb-trow hb-trow-req' }, h(RequestPanel, { sid: item.id, req, item, board }))))),
 
@@ -2934,7 +2972,7 @@ function ChatPanel({ item, board }) {
   const scroller = useRef(null)
   const tr = board.state.transcript.get(item.id)
   const running = item.column === 'running'
-  const stream = running ? item.turn?.stream : ''
+  const stream = running ? liveReply(item.turn, tr) : ''
 
   useEffect(() => {
     if (item.live && (!tr || tr.stale) && !tr?.loading) void board.loadTranscript(item)
