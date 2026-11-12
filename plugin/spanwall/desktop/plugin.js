@@ -18,7 +18,7 @@ import * as React from 'react'
 import * as sdk from '@hermes/plugin-sdk'
 
 const { host, useValue } = sdk
-const { createElement: h, Fragment, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } = React
+const { createElement: h, Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } = React
 
 const PLUGIN_ID = 'spanwall'
 const ROUTE = '/spanwall'
@@ -36,6 +36,9 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const ACTIVITY_LIMIT = 40
 const STREAM_LIMIT = 4000
 const RUNNING_GRACE_MS = 8000
+const TAIL_LIMIT = 20
+const TAIL_GIVE_UP_MS = 60000
+const TOMBSTONE_MS = 120000 // upper bound: a deleted card stays hidden at most this long
 
 const COLUMNS = [
   { key: 'needs', label: 'Needs you', hint: 'approval · clarify · sudo / secret' },
@@ -79,6 +82,25 @@ const clip = (text, n) => {
 }
 
 const oneLine = text => clip(text, 400).replace(/\s+/g, ' ').trim()
+
+// The board's tail entries (see pushTail) this transcript does not show yet. A written message is
+// gone from the tail once a transcript fetched after it exists, or as soon as one carries its text
+// (a fetch sent just before the write may still return it). The rest gives up after a minute.
+const squash = s => String(s || '').replace(/\s+/g, ' ').trim()
+const unseenTail = (entries, tr, running) => {
+  if (!entries?.length) return []
+  if (!tr?.fetchedAt) return entries
+  const recent = { user: [], assistant: [] }
+  for (const m of (tr.messages || []).slice(-12)) recent[m.role]?.push(squash(m.text))
+  return entries.filter(e => {
+    if (e.written && tr.fetchedAt > e.at) return false
+    if (tr.fetchedAt - e.at > TAIL_GIVE_UP_MS) return false
+    // Sealed by a redirect: Hermes may keep or drop that partial text; the transcript after the turn decides.
+    if (e.role === 'assistant' && !e.written && !running && tr.fetchedAt > e.at) return false
+    const text = squash(e.text)
+    return !recent[e.role]?.some(m => m.includes(text))
+  })
+}
 
 const errorText = err => (err && (err.message || err.error?.message)) || String(err || 'Unknown error')
 
@@ -126,6 +148,9 @@ function createBoard(ctx) {
     pinnedOwner: new Map(), // session id → route key for sessions this board created (before their DB row exists)
     models: new Map(), // route key → model.options summary for the new-task form
     compose: null, // { routeKey } while the new-task form is open
+    draft: null, // the new-task form's fields when it was closed without creating (restored on reopen)
+    chatDrafts: new Map(), // session key → unsent text of the viewer / card chat
+    tail: new Map(), // uid → [{ role, text, at, written }] shown after the transcript until it carries them
     viewing: null, // item id shown in the session viewer modal
     viewingKey: null, // its stored key (follows the session when a resume makes it live)
     transcript: new Map(), // item id → { messages, loading, error, stale, loadedAt } for the viewer and the card chat
@@ -137,6 +162,7 @@ function createBoard(ctx) {
     seq: new Map(), // uid → events watermark for session.events.since
     rawIndex: new Map(), // runtime id → uid (gateway events carry only the runtime id)
     archive: readArchive(), // uid → finished turn summary (survives reloads, 24h)
+    deleted: new Map(), // session id (stored or runtime) → { at, routeKey }: keeps an in-flight poll from bringing it back
     connected: true,
     lastError: null
   }
@@ -245,6 +271,7 @@ function createBoard(ctx) {
     state.seq.delete(uid)
     state.usage.delete(uid)
     state.transcript.delete(uid)
+    state.tail.delete(uid)
     if (!state.archive.has(uid)) state.turns.delete(uid)
   }
 
@@ -255,8 +282,8 @@ function createBoard(ctx) {
     if (!t) {
       const rec = state.archive.get(uid)
       t = rec
-        ? { status: rec.status, startedAt: rec.startedAt || 0, endedAt: rec.endedAt, tools: rec.tools || 0, activity: [], stream: '', text: rec.text || '', error: rec.error || null, statusText: '', dismissedAt: rec.dismissedAt || 0 }
-        : { status: 'none', startedAt: 0, endedAt: 0, tools: 0, activity: [], stream: '', text: '', error: null, statusText: '', dismissedAt: 0 }
+        ? { status: rec.status, startedAt: rec.startedAt || 0, endedAt: rec.endedAt, tools: rec.tools || 0, activity: [], stream: '', pending: '', text: rec.text || '', error: rec.error || null, statusText: '', dismissedAt: rec.dismissedAt || 0 }
+        : { status: 'none', startedAt: 0, endedAt: 0, tools: 0, activity: [], stream: '', pending: '', text: '', error: null, statusText: '', dismissedAt: 0 }
       state.turns.set(uid, t)
     }
     return t
@@ -265,7 +292,7 @@ function createBoard(ctx) {
   function startTurn(uid, turnId, startedAt = Date.now()) {
     const t = turn(uid)
     if (t.status === 'running' && (!turnId || t.turnId === turnId)) return t
-    Object.assign(t, { status: 'running', turnId: turnId || null, startedAt, endedAt: 0, tools: 0, stream: '', text: '', error: null, statusText: '' })
+    Object.assign(t, { status: 'running', turnId: turnId || null, startedAt, endedAt: 0, tools: 0, stream: '', pending: '', text: '', error: null, statusText: '' })
     t.activity = t.activity.filter(a => a.kind === 'user' && Date.now() - a.at < 5000) // keep the prompt we just sent
     return t
   }
@@ -299,7 +326,29 @@ function createBoard(ctx) {
       saveArchive()
     }
     markTranscriptStale(uid) // refetched by whoever shows it
+  }
+
+  // Text shown after the transcript until session.history carries it (unseenTail): finished assistant
+  // messages and what the user just sent, so nothing blinks out while the transcript reloads.
+  function pushTail(uid, entry) {
+    const e = { at: Date.now(), written: false, ...entry }
+    state.tail.set(uid, [...(state.tail.get(uid) || []), e].slice(-TAIL_LIMIT))
+    return e
+  }
+
+  function dropTail(uid, e) {
+    const left = (state.tail.get(uid) || []).filter(x => x !== e)
+    left.length ? state.tail.set(uid, left) : state.tail.delete(uid)
+  }
+
+  // Hermes writes each assistant message to the session DB before its tools run (and the final one
+  // before message.complete), and only then emits message.interim / tool.start / message.complete:
+  // from here on session.history carries the text streamed so far.
+  function closeSegment(uid, t, written = true) {
     markTranscriptStale(uid)
+    if (!t.pending.trim()) return
+    pushTail(uid, { role: 'assistant', text: t.pending, written })
+    t.pending = ''
   }
 
   function mergeUsage(uid, usage) {
@@ -363,12 +412,20 @@ function createBoard(ctx) {
       case 'message.delta': {
         const t = turn(uid)
         if (t.status !== 'running') startTurn(uid, p.turn_id)
-        if (typeof p.text === 'string') t.stream = (t.stream + p.text).slice(-STREAM_LIMIT)
+        if (typeof p.text === 'string') {
+          t.stream = (t.stream + p.text).slice(-STREAM_LIMIT)
+          t.pending = (t.pending + p.text).slice(-STREAM_LIMIT)
+        }
+        break
+      }
+      case 'message.interim': {
+        closeSegment(uid, turn(uid))
         break
       }
       case 'tool.start': {
         const t = turn(uid)
         if (t.status !== 'running') startTurn(uid)
+        closeSegment(uid, t)
         t.tools++
         pushActivity(t, { kind: 'tool', id: p.tool_id, label: toolLabel(p), done: false })
         break
@@ -393,12 +450,15 @@ function createBoard(ctx) {
         const t = turn(uid)
         const status = p.status === 'error' ? 'error' : p.status === 'interrupted' ? 'interrupted' : 'complete'
         if (p.usage) mergeUsage(uid, p.usage)
+        if (!t.pending && typeof p.text === 'string') t.pending = p.text // not streamed
+        closeSegment(uid, t)
         endTurn(uid, status, {
           text: typeof p.text === 'string' && p.text ? p.text : t.stream,
           error: status === 'error' ? p.error || p.failure_reason || 'Turn failed' : null
         })
         pushActivity(turn(uid), { kind: status === 'error' ? 'error' : 'done', label: status === 'error' ? `Failed — ${oneLine(p.error || p.failure_reason || '')}` : status === 'interrupted' ? 'Interrupted' : 'Turn complete', done: true })
         removeRequest((_, u) => u === uid)
+        pollSoon() // the last poll still says working
         break
       }
       case 'error': {
@@ -458,11 +518,12 @@ function createBoard(ctx) {
 
   // Profiles whose events never reach this window still move between columns: infer turn
   // start / end from the polled status when no event already did.
-  function reconcileStatus(uid, prev, row) {
+  function reconcileStatus(uid, prev, row, polledAt) {
     const wasRunning = prev && RUNNING_STATUSES.has(prev.status)
     const nowRunning = RUNNING_STATUSES.has(row.status)
     const t = state.turns.get(uid)
-    if (nowRunning && t?.status !== 'running') {
+    // A row read before message.complete arrived is not a new turn.
+    if (nowRunning && t?.status !== 'running' && !(t?.endedAt > polledAt)) {
       startTurn(uid, null, prev ? Date.now() : toMs(row.last_active) || Date.now())
     } else if (wasRunning && row.status === 'idle' && t?.status === 'running') {
       endTurn(uid, 'complete', { text: t.stream || row.preview || '' })
@@ -478,10 +539,12 @@ function createBoard(ctx) {
   // owner of a live row — a backend shared by several profiles returns the SAME active_list to every
   // route, with no profile on the rows — and fill the board for profiles with nothing loaded.
   let storedAt = 0
+  let storedStartedAt = 0 // when the last completed refresh started
   let storedRefreshing = null
   function refreshStored(watched, force = false) {
     if (storedRefreshing) return storedRefreshing
     if (!force && Date.now() - storedAt < STORED_EVERY_MS) return Promise.resolve()
+    const startedAt = Date.now()
     storedRefreshing = (async () => {
       const results = await Promise.allSettled(watched.map(r => rpc(r.route, 'session.list', { limit: STORED_LIST_LIMIT, profile: backendProfile(r) }, false)))
       const owner = new Map()
@@ -497,6 +560,7 @@ function createBoard(ctx) {
       })
       state.owner = owner
       storedAt = Date.now()
+      storedStartedAt = startedAt
     })().finally(() => {
       storedRefreshing = null
     })
@@ -509,6 +573,7 @@ function createBoard(ctx) {
   async function poll() {
     if (polling) return
     polling = true
+    const startedAt = Date.now()
     try {
       if (!state.routes.length || Date.now() - routesAt > ROUTES_EVERY_MS) {
         const next = await loadRoutes()
@@ -550,8 +615,8 @@ function createBoard(ctx) {
         const uid = `${r.key}|${row.id}`
         const prev = state.sessions.get(uid)
         seen.add(uid)
-        state.sessions.set(uid, { ...row, _uid: uid, _rawId: row.id, _routeKey: r.key, _profile: r.label })
-        reconcileStatus(uid, prev, row)
+        state.sessions.set(uid, { ...row, _uid: uid, _rawId: row.id, _routeKey: r.key, _profile: r.label, _polledAt: startedAt })
+        reconcileStatus(uid, prev, row, startedAt)
       }
       if (unknownOwner && Date.now() - lastOwnerRefresh > 10000) {
         lastOwnerRefresh = Date.now()
@@ -571,6 +636,7 @@ function createBoard(ctx) {
       if (usageDue) lastUsageAt = Date.now()
       await Promise.all([...due.map(s => syncRequests(s._uid)), ...(usageDue ? rows.map(s => fetchUsage(s._uid)) : [])])
 
+      if (state.deleted.size) pruneDeleted(startedAt, okRoutes)
       state.connected = okRoutes.size > 0 || watched.length === 0
       state.lastError = state.connected ? null : watched[0]?.error || 'gateway unavailable'
     } catch (err) {
@@ -607,15 +673,36 @@ function createBoard(ctx) {
     const body = text.trim()
     if (!body) return false
     const running = isRunning(uid)
+    // Shown right away, below what has streamed so far; the rest of the reply goes below it.
+    if (running) closeSegment(uid, turn(uid), false)
+    const mine = pushTail(uid, { role: 'user', text: body })
+    emit()
     try {
-      await sessionRpc(uid, running ? 'session.steer' : 'prompt.submit', { text: body })
+      let status = ''
+      if (running) {
+        // Like Hermes Desktop's composer: redirect the live turn (queued as the next turn while it is
+        // still being built) and keep it as a real user message. session.steer is a hidden note that
+        // never shows up in the transcript and waits for the next tool result.
+        try {
+          status = (await sessionRpc(uid, 'session.redirect', { text: body }))?.status || ''
+        } catch (err) {
+          if (!/4010|not support/i.test(`${errorText(err)} ${err?.code ?? ''}`)) throw err
+        }
+      }
+      if (status !== 'redirected' && status !== 'queued') {
+        // Idle, the turn ended meanwhile (rejected), or no redirect support: the gateway's busy policy decides.
+        status = (await sessionRpc(uid, 'prompt.submit', { text: body }))?.status || ''
+      }
       const t = running ? turn(uid) : startTurn(uid)
-      pushActivity(t, { kind: 'user', label: running ? `Steer: ${oneLine(body)}` : `You: ${oneLine(body)}`, done: true })
+      pushActivity(t, { kind: 'user', label: `You: ${oneLine(body)}`, done: true })
+      if (status === 'queued') host.notify({ kind: 'info', message: 'Queued — it runs when the current turn finishes.' })
       markTranscriptStale(uid)
       emit()
       pollSoon(600)
       return true
     } catch (err) {
+      dropTail(uid, mine)
+      emit()
       host.notifyError(err, 'Could not send the message')
       return false
     }
@@ -648,6 +735,7 @@ function createBoard(ctx) {
   async function loadTranscript(item) {
     const cur = state.transcript.get(item.id)
     if (cur?.loading) return
+    const fetchedAt = Date.now()
     state.transcript.set(item.id, { messages: [], ...(cur || {}), loading: true, stale: false })
     emitSoon()
     try {
@@ -688,9 +776,11 @@ function createBoard(ctx) {
         }))
         .filter(m => m.role !== 'tool' && m.text.trim()) // tool calls: open the session in Hermes
         .slice(-TRANSCRIPT_LIMIT)
-      state.transcript.set(item.id, { messages, loading: false, error: null, stale: false, loadedAt: Date.now() })
+      // Marked stale while in flight (a turn ended, a message was flushed): this copy may predate it.
+      const stale = Boolean(state.transcript.get(item.id)?.stale)
+      state.transcript.set(item.id, { messages, loading: false, error: null, stale, loadedAt: Date.now(), fetchedAt })
       if (!item.live && r?.session_id && item.routeKey) {
-        state.transcript.set(`${item.routeKey}|${r.session_id}`, { messages, loading: false, error: null, stale: false, loadedAt: Date.now() })
+        state.transcript.set(`${item.routeKey}|${r.session_id}`, { messages, loading: false, error: null, stale: false, loadedAt: Date.now(), fetchedAt })
       }
     } catch (err) {
       state.transcript.set(item.id, { ...(state.transcript.get(item.id) || { messages: [] }), loading: false, error: errorText(err), stale: false, loadedAt: Date.now() })
@@ -711,6 +801,97 @@ function createBoard(ctx) {
     state.viewing = null
     state.viewingKey = null
     emit()
+  }
+
+  // Delete a session for good (its stored row + transcripts). The backend refuses a session that is
+  // live in it, so a live one is stopped (releasing any approval / clarify wait) and closed first —
+  // the order Hermes' own sidebar uses. Throws; the caller shows the error.
+  // Resolves to 'deleted', 'already' (Hermes no longer lists it) or 'local' (it never had a stored
+  // row: only the card goes).
+  async function remove(item) {
+    const route = routeOf(item.routeKey)
+    if (!route) throw new Error('The profile that owns this session is not connected')
+    const gone = err => /not found|unknown session|4001|4007/i.test(`${errorText(err)} ${err?.code ?? ''}`)
+    // The stored id is the only thing session.delete knows. A live session has one once it wrote a
+    // row; a closed card's archive record falls back to its uid when it never had one.
+    const storedId = item.stored ? item.key
+      : item.live ? state.sessions.get(item.id)?.session_key || (state.owner.has(item.rawId) ? item.rawId : null)
+      : item.key && item.key !== item.id ? item.key : null
+    if (item.live) {
+      if (item.column === 'running' || item.requests.length) {
+        await sessionRpc(item.id, 'session.interrupt').catch(err => {
+          if (!gone(err)) throw err
+        })
+      }
+      await sessionRpc(item.id, 'session.close').catch(() => {})
+    }
+    const target = storedId || (item.live ? item.rawId : null)
+    let outcome = target ? 'deleted' : 'local'
+    if (target) {
+      try {
+        await rpc(route.route, 'session.delete', { session_id: target, profile: backendProfile(route) }, true)
+      } catch (err) {
+        if (!gone(err)) throw err
+        // A live session that never wrote a row has nothing to delete. A known stored id that comes
+        // back "not found" is only taken as deleted once the session lists agree.
+        outcome = storedId ? await confirmGone(storedId, route) : 'local'
+      }
+    }
+    forget(item)
+    return outcome
+  }
+
+  async function confirmGone(id, route) {
+    const watched = state.routes.filter(r => !state.hidden.has(r.key))
+    await refreshStored(watched) // let a list already in flight (from before the delete) finish
+    await refreshStored(watched, true)
+    const owner = state.owner.get(id)
+    if (owner) {
+      const where = owner === route.key ? '' : ` (it is listed under ${routeOf(owner)?.label || owner})`
+      throw new Error(`Hermes could not find it on ${route.label}, but it is still stored${where}. Nothing was deleted.`)
+    }
+    if (state.stored.get(route.key)?.error) {
+      throw new Error(`Hermes could not find it on ${route.label} and the session list could not be checked. It may not have been deleted.`)
+    }
+    return 'already'
+  }
+
+  // Tombstones keep an in-flight poll from bringing a deleted card back. A runtime id is only unique
+  // within its backend, so it is scoped to the route; a stored id is not.
+  function tombstoned(id, routeKey, now) {
+    const d = id && state.deleted.get(id)
+    return Boolean(d) && now - d.at < TOMBSTONE_MS && (!d.routeKey || d.routeKey === routeKey)
+  }
+
+  // A poll that started after the delete no longer lists the session, and a session.list that
+  // started after it no longer has the row: past that point the tombstone only hides id reuse.
+  function pruneDeleted(pollStartedAt, okRoutes) {
+    const now = Date.now()
+    for (const [id, d] of state.deleted) {
+      const settled = d.routeKey ? d.at < pollStartedAt && okRoutes.has(d.routeKey) : d.at < storedStartedAt
+      if (settled || now - d.at >= TOMBSTONE_MS) state.deleted.delete(id)
+    }
+  }
+
+  function forget(item) {
+    const at = Date.now()
+    if (item.rawId) state.deleted.set(item.rawId, { at, routeKey: item.stored ? null : item.routeKey })
+    if (item.key && item.key !== item.rawId && item.key !== item.id) state.deleted.set(item.key, { at, routeKey: null })
+    for (const [uid, s] of state.sessions) if (uid === item.id || s.session_key === item.key) dropSession(uid)
+    for (const [uid, rec] of state.archive) {
+      if (uid !== item.id && rec.key !== item.key) continue
+      state.archive.delete(uid)
+      state.turns.delete(uid)
+    }
+    saveArchive()
+    for (const st of state.stored.values()) {
+      if (st?.rows) st.rows = st.rows.filter(r => r.id !== item.key && r.id !== item.rawId && r.resolved_id !== item.key)
+    }
+    state.transcript.delete(item.id)
+    state.mounted.delete(item.key)
+    if (state.viewing === item.id || state.viewingKey === item.key) closeViewer()
+    emit()
+    pollSoon(400)
   }
 
   function dismiss(uid) {
@@ -738,12 +919,14 @@ function createBoard(ctx) {
   function isRunning(uid, busyBySession) {
     const s = state.sessions.get(uid)
     const route = routeOf(s?._routeKey)
+    const t = state.turns.get(uid)
+    // message.complete outranks a poll taken before it.
+    if (t && t.status !== 'running' && t.endedAt > (s?._polledAt || 0)) return false
     // busyBySession is keyed by runtime id of the window's own gateway — only meaningful for the active profile.
     if (route?.active && s && busyBySession?.[s._rawId]) return true
     if (s && RUNNING_STATUSES.has(s.status)) return true
     // The event stream leads the 3s poll: trust a fresh turn even while the last poll still says idle,
     // but let a stale one (missed message.complete) fall back to the gateway's status.
-    const t = state.turns.get(uid)
     return t?.status === 'running' && (s?.status !== 'idle' || Date.now() - t.startedAt < RUNNING_GRACE_MS)
   }
 
@@ -866,7 +1049,9 @@ function createBoard(ctx) {
         }
       }
     }
-    return out
+    if (!state.deleted.size) return out
+    const now = Date.now()
+    return out.filter(i => !tombstoned(i.key, i.routeKey, now) && !tombstoned(i.rawId, i.routeKey, now))
   }
 
   function refresh() {
@@ -988,6 +1173,7 @@ function createBoard(ctx) {
     send,
     interrupt,
     dismiss,
+    remove,
     open,
     setHidden,
     items
@@ -1049,14 +1235,13 @@ const CSS = `
 .hb-ext:hover{color:var(--hb-fg);background:color-mix(in srgb,currentColor 8%,transparent)}
 .hb-meta-end{margin-left:auto;display:inline-flex;justify-content:flex-end;min-width:0;max-width:48%}
 .hb-meta-end .hb-ptag{max-width:100%}
-.hb-cardstats{display:flex;align-items:center;gap:12px;color:var(--hb-fg4);font-size:11.5px;margin-top:-3px}
-.hb-cardstats .hb-m{display:inline-flex;align-items:center;gap:4px}
 .hb-preview{color:var(--hb-fg2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.hb-preview .hb-who{font-weight:600;color:var(--hb-fg)}
 .hb-card.hb-running .hb-preview{line-height:1.45;height:2.9em} /* live tool text changes length; keep the card height fixed */
 .hb-meta{display:flex;align-items:center;gap:8px;color:var(--hb-fg3);font-size:12px;flex-wrap:nowrap;min-width:0}
 .hb-meta>.hb-state{flex:none;white-space:nowrap}
 .hb-meta>.hb-meta-end{flex:0 1 auto;min-width:22px}
-.hb-meta .hb-m{display:inline-flex;align-items:center;gap:4px}
+.hb-meta .hb-m{flex:none;display:inline-flex;align-items:center;gap:4px;color:var(--hb-fg4);font-size:11.5px}
 .hb-state{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--hb-fg2)}
 .hb-dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
 .hb-spin{width:11px;height:11px;border-radius:50%;border:1.6px solid color-mix(in srgb,var(--hb-run) 30%,transparent);border-top-color:var(--hb-run);animation:hb-spin .9s linear infinite;display:inline-block}
@@ -1086,6 +1271,13 @@ const CSS = `
 .hb-btn.hb-primary{background:var(--hb-fg);color:var(--hb-card);border-color:var(--hb-fg)}
 .hb-btn.hb-primary:hover{opacity:.88;background:var(--hb-fg)}
 .hb-btn.hb-small{height:24px;padding:0 9px;font-size:12px}
+.hb-btn.hb-danger{background:var(--hb-fail);border-color:var(--hb-fail);color:#fff}
+.hb-btn.hb-danger:hover{background:color-mix(in srgb,var(--hb-fail) 88%,#000)}
+.hb-ext.hb-ext-danger:hover{color:var(--hb-fail);background:color-mix(in srgb,var(--hb-fail) 10%,transparent)}
+.hb-modal.hb-confirm{max-width:440px}
+.hb-confirm-text{margin:0;font-size:13.5px;line-height:1.55;color:var(--hb-fg2);word-break:break-word}
+.hb-confirm-text b{color:var(--hb-fg);font-weight:600}
+.hb-confirm-warn{display:flex;align-items:center;gap:6px;color:var(--hb-needs)}
 .hb-input,.hb-textarea{width:100%;box-sizing:border-box;border-radius:7px;border:1px solid var(--hb-line);background:transparent;color:inherit;font:inherit;padding:6px 8px;outline:none}
 .hb-input:focus,.hb-textarea:focus{border-color:var(--hb-accent)}
 .hb-textarea{resize:vertical;min-height:34px;max-height:160px}
@@ -1108,6 +1300,14 @@ const CSS = `
 .hb-vresize:after{content:"";position:absolute;top:50%;left:3px;width:4px;height:44px;margin-top:-22px;border-radius:4px;background:var(--hb-fg4);opacity:0;transition:opacity .15s}
 .hb-vresize:hover:after,.hb-resizing .hb-vresize:after{opacity:.7}
 .hb-viewer.hb-resizing{user-select:none;animation:none}
+.hb-viewer[data-slot]{-webkit-backdrop-filter:none;backdrop-filter:none}
+.hb-viewer .hb-transcript,.hb-viewer .hb-vside{-webkit-user-select:text;user-select:text}
+.hb-viewer button,.hb-viewer.hb-resizing *{-webkit-user-select:none;user-select:none}
+.hb-ctxmenu{position:fixed;z-index:1001;min-width:180px;padding:4px;display:flex;flex-direction:column;border-radius:10px;background:var(--hb-card);color:var(--hb-fg);border:1px solid var(--hb-line);box-shadow:0 12px 32px -8px rgba(0,0,0,.35);font-size:13px;animation:hb-fade .08s ease-out}
+.hb-ctxitem{display:flex;align-items:center;gap:16px;border:0;background:transparent;color:inherit;font:inherit;padding:6px 10px;border-radius:6px;cursor:pointer;text-align:left}
+.hb-ctxitem:hover:not(:disabled),.hb-ctxitem:focus-visible{outline:none;background:color-mix(in srgb,var(--hb-accent) 14%,transparent)}
+.hb-ctxitem:disabled{color:var(--hb-fg4);cursor:default}
+.hb-ctxkey{margin-left:auto;color:var(--hb-fg4);font-size:11.5px}
 .hb-vbar{display:flex;align-items:center;gap:10px;height:52px;padding:0 10px 0 8px;border-bottom:1px solid var(--hb-line);flex:none;min-width:0}
 .hb-vbar-title{font-size:14.5px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:60px;max-width:40%}
 .hb-ghost.hb-on{color:var(--hb-fg);background:color-mix(in srgb,currentColor 8%,transparent)}
@@ -1324,7 +1524,6 @@ function injectStyles(ctx) {
 const ICONS = {
   sparkle: 'M8 1.5l1.4 4.1L13.5 7 9.4 8.4 8 12.5 6.6 8.4 2.5 7l4.1-1.4z',
   warn: 'M8 2l6.5 11.5h-13zM8 6.5v3.2M8 11.6v.2',
-  wrench: 'M10.2 2.3a3.2 3.2 0 00-3.9 4.1L2.3 10.4a1.3 1.3 0 001.8 1.8l4-4a3.2 3.2 0 004.1-3.9L10.4 6.1 8.9 5.6l-.5-1.5z',
   chat: 'M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z',
   ext: 'M9.5 2.5h4v4M13.5 2.5L7.5 8.5M11.5 9.5v3.5h-9v-9H6',
   board: 'M2.5 3h3v10h-3zM6.5 3h3v6h-3zM10.5 3h3v8h-3z',
@@ -1338,6 +1537,7 @@ const ICONS = {
   arrowUp: 'M8 13V3.5M3.5 8L8 3.5 12.5 8',
   expand: 'M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5L9 7M2.5 13.5L7 9',
   copy: 'M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3',
+  trash: 'M2.5 4.5h11M6.5 4.5V2.5h3v2M4 4.5l.7 9h6.6l.7-9M6.7 7v4.5M9.3 7v4.5',
   panel: 'M2.5 3.5h11v9h-11zM10 3.5v9'
 }
 
@@ -1490,15 +1690,23 @@ function BoardPage({ board, ctx }) {
 
   const all = board.items(busyBySession)
   const routes = board.state.routes.filter(r => !board.state.hidden.has(r.key))
-  const filterKey = routes.some(r => r.key === profileFilter) ? profileFilter : null
+  // Several profiles can be picked at once; an empty selection means all of them. Older builds
+  // stored a single key, so a string is read as a one-profile selection.
+  const stored = Array.isArray(profileFilter) ? profileFilter : profileFilter ? [profileFilter] : []
+  const filterKeys = routes.filter(r => stored.includes(r.key)).map(r => r.key)
+  const filterSet = new Set(filterKeys)
+  // The one picked profile, if exactly one is: New task opens on it.
+  const filterKey = filterKeys.length === 1 ? filterKeys[0] : null
   const pickProfile = key => {
-    const next = key === filterKey ? null : key
-    setProfileFilter(next)
-    writeStored(ctx, 'profileFilter', next)
+    const next = key == null ? [] : filterSet.has(key) ? filterKeys.filter(k => k !== key) : [...filterKeys, key]
+    // Picking every profile is the same as picking none.
+    const value = next.length === routes.length ? [] : next
+    setProfileFilter(value)
+    writeStored(ctx, 'profileFilter', value)
   }
   const q = query.trim().toLowerCase()
   const matching = q ? all.filter(i => `${i.title} ${i.preview} ${i.model} ${i.profileLabel}`.toLowerCase().includes(q)) : all
-  const visible = filterKey ? matching.filter(i => i.routeKey === filterKey) : matching
+  const visible = filterSet.size ? matching.filter(i => filterSet.has(i.routeKey)) : matching
 
   const byCol = Object.fromEntries(COLUMNS.map(c => [c.key, []]))
   for (const it of visible) if (byCol[it.column]) byCol[it.column].push(it)
@@ -1524,7 +1732,8 @@ function BoardPage({ board, ctx }) {
     writeStored(ctx, 'view', v)
   }
 
-  const renderCard = it => h(Card, { key: it.id, item: it, board, now, multiProfile: routes.length > 1, open: isOpen(it), onToggle: () => toggle(it) })
+  const [doomed, setDoomed] = useState(null) // card waiting on the delete confirmation
+  const renderCard = it => h(Card, { key: it.id, item: it, board, now, multiProfile: routes.length > 1, open: isOpen(it), onToggle: () => toggle(it), onDelete: () => setDoomed(it) })
 
   return h('div', { className: 'hb-root', ref: rootRef },
     h('div', { className: 'hb-head' },
@@ -1545,9 +1754,10 @@ function BoardPage({ board, ctx }) {
         h('button', { 'aria-pressed': view === 'board', onClick: () => pickView('board') }, h(Icon, { name: 'board' }), 'Board'),
         h('button', { 'aria-pressed': view === 'list', onClick: () => pickView('list') }, h(Icon, { name: 'list' }), 'List'))),
     board.state.lastError && h('div', { className: 'hb-banner' }, `Could not read sessions from the gateway: ${board.state.lastError}`),
-    routes.length > 1 && h(ProfileBar, { items: matching, routes, filterKey, onPick: pickProfile }),
+    routes.length > 1 && h(ProfileBar, { items: matching, routes, filterSet, onPick: pickProfile }),
     board.state.viewing && h(SessionModal, { key: board.state.viewing, board, ctx,
       item: all.find(i => i.live && i.key === board.state.viewingKey) || all.find(i => i.id === board.state.viewing) || null }),
+    doomed && h(DeleteDialog, { key: doomed.id, board, item: all.find(i => i.id === doomed.id) || doomed, onClose: () => setDoomed(null) }),
     board.state.compose && h(NewTaskPanel, { key: board.state.compose.at, board, ctx, initialRouteKey: board.state.compose.routeKey || filterKey }),
     view === 'board'
       ? h('div', { className: 'hb-board' },
@@ -1579,14 +1789,19 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
     const remembered = readStored(ctx, 'lastTaskProfile', null)
     return [initialRouteKey, remembered].find(k => k && routes.some(r => r.key === k)) || routes.find(r => r.active)?.key || routes[0]?.key || ''
   }
-  const [routeKey, setRouteKey] = useState(pickDefault)
-  const [prompt, setPrompt] = useState('')
-  const [title, setTitle] = useState('')
+  // Every way of closing (Esc, backdrop, ×, the toolbar button) keeps an unsent draft for next time.
+  const [draft] = useState(() => {
+    const d = board.state.draft
+    return d && routes.some(r => r.key === d.routeKey) ? d : null
+  })
+  const [routeKey, setRouteKey] = useState(() => draft?.routeKey || pickDefault())
+  const [prompt, setPrompt] = useState(draft?.prompt || '')
+  const [title, setTitle] = useState(draft?.title || '')
   const [advanced, setAdvanced] = useState(() => readStored(ctx, 'taskAdvancedOpen', false))
-  const [modelSel, setModelSel] = useState('')
-  const [effort, setEffort] = useState('')
-  const [fast, setFast] = useState('')
-  const [cwd, setCwd] = useState('')
+  const [modelSel, setModelSel] = useState(draft?.modelSel || '')
+  const [effort, setEffort] = useState(draft?.effort || '')
+  const [fast, setFast] = useState(draft?.fast || '')
+  const [cwd, setCwd] = useState(draft?.cwd || '')
   const [openAfter, setOpenAfter] = useState(() => readStored(ctx, 'taskOpenAfter', false))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
@@ -1598,14 +1813,47 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
   useEffect(() => {
     if (routeKey) void board.loadModels(routeKey)
   }, [routeKey, board])
+  // A restored draft opens with the caret at its end (typing continues it) and the box sized to fit.
   useEffect(() => {
-    promptRef.current?.focus()
+    const el = promptRef.current
+    if (!el) return
+    el.focus()
+    const end = el.value.length
+    el.setSelectionRange(end, end)
+    if (end) {
+      el.style.height = `${Math.min(el.scrollHeight, 260)}px`
+      el.scrollTop = el.scrollHeight
+    }
   }, [])
   // A model list belongs to one profile: switching profile resets the pick.
-  useEffect(() => setModelSel(''), [routeKey])
+  const pickRoute = k => {
+    if (k !== routeKey) {
+      setModelSel('')
+      setEffort('') // picked for a model of the previous profile
+      setFast('')
+    }
+    setRouteKey(k)
+  }
 
   const [provider, model] = modelSel ? modelSel.split('\u0000') : ['', '']
   const caps = model ? models?.providers?.find(p => p.slug === provider)?.capabilities?.[model] : null
+  // A model without the knob gets the default, not what was picked for the previous model.
+  const noReasoning = Boolean(caps && caps.reasoning === false)
+  const noFast = Boolean(caps && !caps.fast)
+  useEffect(() => {
+    if (noReasoning) setEffort('')
+  }, [noReasoning])
+  useEffect(() => {
+    if (noFast) setFast('')
+  }, [noFast])
+
+  const created = useRef(false)
+  const fieldsRef = useRef(null)
+  fieldsRef.current = { routeKey, prompt, title, modelSel, effort, fast, cwd }
+  useEffect(() => () => {
+    const f = fieldsRef.current
+    board.state.draft = created.current || !(f.prompt.trim() || f.title.trim() || f.cwd.trim()) ? null : f
+  }, [board])
   const close = () => !busy && board.closeComposer()
   const empty = !prompt.trim()
   const [attempted, setAttempted] = useState(false)
@@ -1640,7 +1888,12 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
     setBusy(true)
     setError(null)
     try {
-      await board.createSession(routeKey, { prompt, title, model, provider, reasoningEffort: effort, fast, cwd, openAfter, idempotencyKey: idem.current })
+      await board.createSession(routeKey, {
+        prompt, title, model, provider, cwd, openAfter, idempotencyKey: idem.current,
+        reasoningEffort: noReasoning ? '' : effort,
+        fast: noFast ? '' : fast
+      })
+      created.current = true
       writeStored(ctx, 'lastTaskProfile', routeKey)
       writeStored(ctx, 'taskOpenAfter', openAfter)
       host.notify({ kind: 'success', message: `Session created on profile ${route?.label || routeKey}` })
@@ -1670,7 +1923,7 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
     }))
   }]
 
-  return h('div', { className: 'hb-modal-backdrop', onMouseDown: e => e.target === e.currentTarget && !prompt.trim() && close() },
+  return h('div', { className: 'hb-modal-backdrop', onMouseDown: e => e.target === e.currentTarget && close() },
     h('div', { className: 'hb-modal hb-taskmodal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'hb-modal-title' },
       h('div', { className: 'hb-modal-head' },
         h('div', { id: 'hb-modal-title', className: 'hb-modal-title' }, 'New task'),
@@ -1702,7 +1955,7 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
             h(Combo, {
               variant: 'pill', searchable: routes.length > 6, minPopWidth: 220,
               escapeRef: comboEscape,
-              value: routeKey, onChange: setRouteKey, disabled: busy,
+              value: routeKey, onChange: pickRoute, disabled: busy,
               groups: profileGroups, placeholder: 'Search profiles…', title: 'Profile to run the task'
             }),
             h(Combo, {
@@ -1720,7 +1973,7 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
               busy ? h('span', { className: 'hb-spin hb-spin-light' }) : h(Icon, { name: 'arrowUp', size: 16 })))),
         attempted && empty
           ? h('div', { id: 'hb-prompt-err', className: 'hb-field-err', role: 'alert' }, 'Enter a task prompt before creating it.')
-          : h('div', { className: 'hb-tbox-hint' }, 'Enter to create · Shift+Enter for a new line · Esc to close'),
+          : h('div', { className: 'hb-tbox-hint' }, 'Enter to create · Shift+Enter for a new line · Esc to close (the draft is kept)'),
 
         advanced && h('div', { className: 'hb-adv' },
           h('div', { className: 'hb-adv-grid' },
@@ -1732,11 +1985,11 @@ function NewTaskPanel({ board, ctx, initialRouteKey }) {
               h('input', { className: 'hb-field-input hb-mono', value: cwd, disabled: busy, placeholder: "profile's terminal.cwd", onChange: e => setCwd(e.target.value) }))),
           h('div', { className: 'hb-section' },
             h('div', { className: 'hb-flabel' }, 'Reasoning effort', caps && caps.reasoning === false && h('span', { className: 'hb-flabel-note' }, ' · not supported by this model')),
-            h(Segmented, { value: effort, onChange: setEffort, disabled: busy || (caps && caps.reasoning === false),
+            h(Segmented, { value: noReasoning ? '' : effort, onChange: setEffort, disabled: busy || noReasoning,
               options: [{ value: '', label: 'Default' }, ...EFFORTS.map(x => ({ value: x, label: x }))] })),
           h('div', { className: 'hb-section' },
             h('div', { className: 'hb-flabel' }, 'Fast mode', caps && !caps.fast && h('span', { className: 'hb-flabel-note' }, ' · this model has no fast tier')),
-            h(Segmented, { value: fast, onChange: setFast, disabled: busy || (caps && !caps.fast),
+            h(Segmented, { value: noFast ? '' : fast, onChange: setFast, disabled: busy || noFast,
               options: [{ value: '', label: 'Default' }, { value: 'on', label: 'On' }, { value: 'off', label: 'Off' }] })),
           h('label', { className: 'hb-switch-row' },
             h('span', { className: `hb-switch${openAfter ? ' hb-on' : ''}` },
@@ -1886,8 +2139,9 @@ function Combo({ value, onChange, groups, defaultLabel = null, placeholder = 'Se
 }
 
 
-// One chip per profile route: filter on click, with live / needs counts and reachability.
-function ProfileBar({ items, routes, filterKey, onPick }) {
+// One chip per profile route: a click adds or removes it from the filter, with live / needs
+// counts and reachability. "All profiles" clears the selection.
+function ProfileBar({ items, routes, filterSet, onPick }) {
   const stats = list => ({
     cards: list.length,
     live: list.filter(i => i.live).length,
@@ -1897,7 +2151,7 @@ function ProfileBar({ items, routes, filterKey, onPick }) {
   const breakdown = s => `${s.cards} cards: ${s.live} live · ${s.stored} saved · ${s.cards - s.live - s.stored} closed${s.needs ? ` · ${s.needs} need you` : ''}`
   const total = stats(items)
   return h('div', { className: 'hb-profiles', role: 'toolbar', 'aria-label': 'Profiles' },
-    h('button', { className: 'hb-pchip', 'aria-pressed': !filterKey, title: breakdown(total), onClick: () => onPick(null) },
+    h('button', { className: 'hb-pchip', 'aria-pressed': !filterSet.size, title: breakdown(total), onClick: () => onPick(null) },
       'All profiles', h('span', { className: 'hb-pcount' }, total.cards),
       total.needs > 0 && h('span', { className: 'hb-pneeds' }, total.needs)),
     routes.map(r => {
@@ -1905,7 +2159,7 @@ function ProfileBar({ items, routes, filterKey, onPick }) {
       return h('button', {
         key: r.key,
         className: `hb-pchip${r.error ? ' hb-perr' : ''}`,
-        'aria-pressed': filterKey === r.key,
+        'aria-pressed': filterSet.has(r.key),
         title: r.error ? `Unreachable: ${r.error}` : `${r.label}${r.active ? ' (current)' : ''} — ${breakdown(s)}`,
         onClick: () => onPick(r.key)
       },
@@ -1947,16 +2201,17 @@ function cardPreview(item) {
   const t = item.turn
   if (item.column === 'needs') return requestSummary(item.requests[0])
   if (item.column === 'running') {
+    // Who is working and on what — not the raw stream, which churns too fast to read on a card.
     const cur = t?.activity.filter(a => a.kind === 'tool' && !a.done).at(-1)
-    return cur?.label || t?.statusText || (t?.stream ? oneLine(t.stream.slice(-240)) : item.preview)
+    const phase = cur ? `Running ${cur.label}` : t?.statusText || (t?.stream ? 'Writing a reply…' : 'Thinking…')
+    return h(Fragment, null, h('span', { className: 'hb-who' }, item.profileLabel || 'Hermes'), ` · ${phase}`)
   }
   if (item.column === 'failed') return t?.error || item.preview
   if (item.column === 'done') return oneLine(t?.text || item.preview)
   return item.preview
 }
 
-function Card({ item, board, now, multiProfile, open, onToggle }) {
-  const tools = item.turn?.tools || 0
+function Card({ item, board, now, multiProfile, open, onToggle, onDelete }) {
   const header = h('div', { className: 'hb-cardhead', onClick: onToggle, role: 'button', 'aria-expanded': open, tabIndex: 0, onKeyDown: e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), onToggle()) },
     h('span', { className: `hb-c-${item.column}`, style: { marginTop: 2 } }, h(Icon, { name: 'sparkle', size: 13, fill: true })),
     h('span', { className: 'hb-title' },
@@ -1967,19 +2222,70 @@ function Card({ item, board, now, multiProfile, open, onToggle }) {
     // Actions float over the title's end on hover, so the title keeps the full card width.
     h('span', { className: 'hb-card-actions' },
       h('button', { className: 'hb-ext', title: 'View session', onClick: e => (e.stopPropagation(), board.openViewer(item)) }, h(Icon, { name: 'expand', size: 12 })),
-      h('button', { className: 'hb-ext', title: 'Open in Hermes', onClick: e => (e.stopPropagation(), void board.open(item)) }, h(Icon, { name: 'ext', size: 12 }))))
+      h('button', { className: 'hb-ext', title: 'Open in Hermes', onClick: e => (e.stopPropagation(), void board.open(item)) }, h(Icon, { name: 'ext', size: 12 })),
+      onDelete && h('button', { className: 'hb-ext hb-ext-danger', title: 'Delete session', onClick: e => (e.stopPropagation(), onDelete()) }, h(Icon, { name: 'trash', size: 12 }))))
 
   return h('article', { className: `hb-card${open ? ' hb-sel' : ''}${item.column === 'running' ? ' hb-running' : ''}`, 'data-card-id': item.id, 'data-col': item.column },
     header,
     h('div', { className: 'hb-preview' }, cardPreview(item) || h('span', { style: { color: 'var(--hb-fg4)' } }, 'No preview')),
-    // Footer: two fixed lines so every card keeps the same shape whatever the profile name's length.
+    // Footer: one fixed line so every card keeps the same shape whatever the profile name's length.
     h('div', { className: 'hb-meta' },
       h(StatusLine, { item, now }),
+      item.messageCount != null && h('span', { className: 'hb-m', title: 'Messages' }, h(Icon, { name: 'chat', size: 12 }), item.messageCount),
       multiProfile && h('span', { className: 'hb-meta-end' }, h(ProfileTag, { item }))),
-    h('div', { className: 'hb-cardstats' },
-      h('span', { className: 'hb-m', title: 'Messages' }, h(Icon, { name: 'chat', size: 12 }), item.messageCount),
-      h('span', { className: 'hb-m', title: 'Tool calls (current / last turn)' }, h(Icon, { name: 'wrench', size: 12 }), tools)),
     open && h(CardBody, { item, board, now }))
+}
+
+// ── delete confirmation ──
+
+function DeleteDialog({ board, item, onClose }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const cancelRef = useRef(null)
+  const busyRef = useRef(false)
+  busyRef.current = busy
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  useEffect(() => {
+    cancelRef.current?.focus() // the safe choice holds the focus
+    const onKey = e => {
+      if (e.key !== 'Escape' || e.isComposing) return
+      e.preventDefault()
+      e.stopPropagation()
+      if (!busyRef.current) closeRef.current()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+
+  const confirm = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const outcome = await board.remove(item)
+      host.notify({ kind: 'info', message: outcome === 'already' ? 'Session was already deleted' : outcome === 'local' ? 'Removed from the board (Hermes had not stored this session)' : 'Session deleted' })
+      onClose()
+    } catch (err) {
+      setError(errorText(err))
+      setBusy(false)
+    }
+  }
+
+  const stops = item.live && (item.column === 'running' || item.requests.length > 0)
+  return h('div', { className: 'hb-modal-backdrop', onMouseDown: e => e.target === e.currentTarget && !busy && onClose() },
+    h('div', { className: 'hb-modal hb-confirm', role: 'alertdialog', 'aria-modal': true, 'aria-labelledby': 'hb-del-title', 'aria-describedby': 'hb-del-desc' },
+      h('div', { className: 'hb-modal-head' }, h('div', null, h('div', { id: 'hb-del-title', className: 'hb-modal-title' }, 'Delete session?'))),
+      h('div', { className: 'hb-modal-body' },
+        h('p', { id: 'hb-del-desc', className: 'hb-confirm-text' },
+          h('b', null, item.title), ' and its transcript will be permanently deleted',
+          item.profileLabel ? h(Fragment, null, ' from ', h('b', null, item.profileLabel)) : null, ". This can't be undone."),
+        stops && h('p', { className: 'hb-confirm-text hb-confirm-warn' }, h(Icon, { name: 'warn', size: 12 }),
+          item.column === 'running' ? 'The running turn will be stopped first.' : 'Its pending request will be cancelled first.'),
+        error && h('div', { className: 'hb-modal-err' }, `Could not delete the session: ${error}`),
+        h('div', { className: 'hb-row hb-end' },
+          h('button', { ref: cancelRef, className: 'hb-btn', disabled: busy, onClick: onClose }, 'Cancel'),
+          h('button', { className: 'hb-btn hb-danger', disabled: busy, onClick: () => void confirm() },
+            busy ? h('span', { className: 'hb-spin hb-spin-light' }) : h(Icon, { name: 'trash', size: 12 }), busy ? 'Deleting…' : 'Delete')))))
 }
 
 // ── session viewer ──
@@ -2283,6 +2589,101 @@ function TranscriptRow({ m, item, onExpand }) {
     open && h('div', { className: 'hb-sys-body' }, h(RichText, { text: clip(m.text, 40000), item })))
 }
 
+// ── right-click Copy / Cut / Paste ──
+//
+// Hermes Desktop answers every right-click with its own app menu (a window capture listener that
+// stops propagation), which portals into the viewer via its data-slot. This menu only runs on hosts
+// without that listener.
+
+const MOD_KEY = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '') ? '⌘' : 'Ctrl+'
+
+// A text field the menu can edit: textarea / text-like input that exposes a selection range.
+function textFieldOf(el) {
+  const f = el?.closest?.('textarea, input')
+  return f && typeof f.selectionStart === 'number' ? f : null
+}
+
+// Replace [start, end) of a field with `str` the way typing would, so React's onChange and undo see it.
+function insertInto(el, start, end, str) {
+  el.focus()
+  try {
+    el.setSelectionRange(start, end)
+  } catch {}
+  try {
+    if (document.execCommand(str ? 'insertText' : 'delete', false, str)) return
+  } catch {}
+  const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, el.value.slice(0, start) + str + el.value.slice(end))
+  el.setSelectionRange(start + str.length, start + str.length)
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+// What a right-click at `e` can act on, or null when there is nothing to offer.
+function contextMenuAt(e) {
+  const field = textFieldOf(e.target)
+  if (field) {
+    const start = field.selectionStart
+    const end = field.selectionEnd
+    const secret = field.type === 'password'
+    const writable = !field.readOnly && !field.disabled
+    const text = secret ? '' : field.value.slice(start, end)
+    return { x: e.clientX, y: e.clientY, text, field, start, end, canCut: writable && Boolean(text), canPaste: writable }
+  }
+  const text = window.getSelection?.()?.toString() || ''
+  return text ? { x: e.clientX, y: e.clientY, text, field: null, canCut: false, canPaste: false } : null
+}
+
+function ContextMenu({ menu, onClose }) {
+  const ref = useRef(null)
+  const [pos, setPos] = useState({ left: menu.x, top: menu.y })
+  useLayoutEffect(() => {
+    const r = ref.current?.getBoundingClientRect()
+    if (!r) return
+    setPos({ left: Math.max(4, Math.min(menu.x, window.innerWidth - r.width - 4)), top: Math.max(4, Math.min(menu.y, window.innerHeight - r.height - 4)) })
+  }, [menu])
+  useEffect(() => {
+    const away = e => !ref.current?.contains(e.target) && onClose()
+    const dismiss = () => onClose()
+    window.addEventListener('mousedown', away, true)
+    window.addEventListener('scroll', dismiss, true)
+    window.addEventListener('resize', dismiss)
+    window.addEventListener('blur', dismiss)
+    return () => {
+      window.removeEventListener('mousedown', away, true)
+      window.removeEventListener('scroll', dismiss, true)
+      window.removeEventListener('resize', dismiss)
+      window.removeEventListener('blur', dismiss)
+    }
+  }, [onClose])
+
+  const run = fn => async () => {
+    onClose()
+    try {
+      await fn()
+    } catch (err) {
+      host.notifyError(err, 'Clipboard action failed')
+    }
+  }
+  const { field, start, end, text } = menu
+  const items = [
+    field && { label: 'Cut', key: 'X', enabled: menu.canCut, act: async () => {
+      await navigator.clipboard.writeText(text)
+      insertInto(field, start, end, '')
+    } },
+    { label: 'Copy', key: 'C', enabled: Boolean(text), act: async () => {
+      await navigator.clipboard.writeText(text)
+      field?.focus()
+    } },
+    field && { label: 'Paste', key: 'V', enabled: menu.canPaste, act: async () => insertInto(field, start, end, await navigator.clipboard.readText()) }
+  ].filter(Boolean)
+
+  return h('div', { ref, className: 'hb-ctxmenu', role: 'menu', style: pos,
+    onMouseDown: e => e.preventDefault(), // keep the selection and the field's focus
+    onContextMenu: e => e.preventDefault() },
+    items.map(it => h('button', { key: it.label, className: 'hb-ctxitem', role: 'menuitem', disabled: !it.enabled, onClick: run(it.act) },
+      it.label, h('span', { className: 'hb-ctxkey' }, `${MOD_KEY}${it.key}`))))
+}
+
 // A session opened in place, laid out like a Hermes chat: full-window, a centred transcript column,
 // the composer at the bottom and a collapsible details panel. Esc closes (window-level).
 function SessionModal({ board, ctx, item: liveItem }) {
@@ -2292,7 +2693,7 @@ function SessionModal({ board, ctx, item: liveItem }) {
   if (liveItem) lastItem.current = liveItem
   const item = liveItem || lastItem.current
   const now = useNow(Boolean(item && (item.column === 'running' || item.column === 'needs')), 1000)
-  const [text, setText] = useState('')
+  const [text, setText] = useChatDraft(board, item)
   const [sending, setSending] = useState(false)
   const [side, setSide] = useState(() => readStored(ctx, 'viewerSide', false))
   const [width, setWidth] = useState(() => readStored(ctx, 'viewerWidth', VIEWER_DEFAULT_WIDTH))
@@ -2344,16 +2745,29 @@ function SessionModal({ board, ctx, item: liveItem }) {
   const close = () => board.closeViewer()
   const closeRef = useRef(close)
   closeRef.current = close
+  const [menu, setMenu] = useState(null) // right-click Copy / Cut / Paste
+  const menuOpen = useRef(false)
+  menuOpen.current = Boolean(menu)
+  const closeMenu = useCallback(() => setMenu(null), [])
+  const openMenu = e => {
+    const m = contextMenuAt(e)
+    setMenu(m)
+    if (!m) return
+    e.preventDefault()
+    e.stopPropagation()
+  }
 
   useEffect(() => {
     const onKey = e => {
       if (e.key !== 'Escape' || e.isComposing) return
+      if (document.querySelector('[data-slot="dropdown-menu-content"]')) return // the host's menu closes on its own Esc
       e.preventDefault()
       e.stopPropagation()
-      closeRef.current()
+      if (menuOpen.current) setMenu(null) // Esc closes the menu first, the viewer next
+      else closeRef.current()
     }
     window.addEventListener('keydown', onKey, true)
-    inputRef.current?.focus()
+    focusAtEnd(inputRef.current, 220)
     return () => window.removeEventListener('keydown', onKey, true)
   }, [])
 
@@ -2369,12 +2783,13 @@ function SessionModal({ board, ctx, item: liveItem }) {
     return () => clearInterval(t)
   }, [item?.id, running, board])
 
-  const stream = running ? item?.turn?.stream || '' : ''
+  const stream = running ? item?.turn?.pending || '' : ''
   const messages = tr?.messages || []
+  const tail = item ? unseenTail(board.state.tail.get(item.id), tr, running) : []
   useLayoutEffect(() => {
     const el = scroller.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
-  }, [messages.length, stream.length, tr?.loadedAt, item?.requests?.length])
+  }, [messages.length, tail.length, stream.length, tr?.loadedAt, item?.requests?.length])
   // Content can also grow without a render of ours (code blocks wrapping, a request card opening):
   // follow it while the reader is at the bottom.
   const colRef = useRef(null)
@@ -2410,7 +2825,9 @@ function SessionModal({ board, ctx, item: liveItem }) {
   const row = (k, v) => (v || v === 0 ? h('div', { className: 'hb-kv' }, h('span', null, k), h('b', null, v)) : null)
 
   return h('div', { className: 'hb-modal-backdrop hb-viewer-backdrop', onMouseDown: e => e.target === e.currentTarget && close() },
-    h('div', { className: `hb-viewer${side ? ' hb-with-side' : ''}${resizing ? ' hb-resizing' : ''}`, style: { width: clampWidth(width) }, role: 'dialog', 'aria-modal': true, 'aria-label': item.title },
+    h('div', { className: `hb-viewer${side ? ' hb-with-side' : ''}${resizing ? ' hb-resizing' : ''}`, style: { width: clampWidth(width) }, role: 'dialog', 'aria-modal': true, 'aria-label': item.title, onContextMenu: openMenu,
+      // Hermes' app-wide right-click menu portals into the enclosing dialog-content, i.e. above this modal.
+      'data-slot': 'dialog-content' },
       handle(-1),
       handle(1),
       h('header', { className: 'hb-vbar' },
@@ -2433,11 +2850,12 @@ function SessionModal({ board, ctx, item: liveItem }) {
             h('div', { className: 'hb-tcol', ref: colRef },
               tr?.loading && !messages.length && h('div', { className: 'hb-tempty' }, h('span', { className: 'hb-spin' }), 'Loading conversation…'),
               tr?.error && h('div', { className: 'hb-modal-err' }, `Could not load the conversation: ${tr.error}`, h('button', { className: 'hb-btn hb-small', style: { marginLeft: 10 }, onClick: () => void board.loadTranscript(item) }, 'Retry')),
-              !tr?.loading && !tr?.error && !messages.length && !stream && h('div', { className: 'hb-tempty' }, 'No messages yet.'),
+              !tr?.loading && !tr?.error && !messages.length && !tail.length && !stream && h('div', { className: 'hb-tempty' }, 'No messages yet.'),
               messages.map((m, i) => h(TranscriptRow, { key: m.id ?? i, m, item, onExpand: () => { stick.current = false } })),
+              tail.map(e => h(TranscriptRow, { key: `tail-${e.at}-${e.role}`, m: e, item })),
               running && h('div', { className: 'hb-trow hb-trow-assistant' },
                 h('div', { className: 'hb-aname' }, h('span', { className: 'hb-avatar hb-avatar-live' }, h(Icon, { name: 'sparkle', size: 11, fill: true })), 'Hermes',
-                  h('span', { className: 'hb-tmeta' }, liveTool ? `running ${liveTool.label}` : t?.statusText || 'thinking…')),
+                  h('span', { className: 'hb-tmeta' }, liveTool ? `running ${liveTool.label}` : t?.statusText || (stream ? 'writing…' : 'thinking…'))),
                 h('div', { className: 'hb-abody' }, stream ? h(RichText, { text: stream, item }) : null, h('span', { className: 'hb-caret-blink' }))),
               item.requests.map(req => h('div', { key: req.id, className: 'hb-trow hb-trow-req' }, h(RequestPanel, { sid: item.id, req, item, board }))))),
 
@@ -2488,7 +2906,9 @@ function SessionModal({ board, ctx, item: liveItem }) {
             row('Started', item.startedAt ? new Date(item.startedAt).toLocaleString() : null),
             row('Source', item.source),
             h('div', { className: 'hb-kv' }, h('span', null, 'Session id'),
-              h('button', { className: 'hb-idbtn', title: 'Copy session id', onClick: () => copyText(item.key) }, h('code', null, item.key), h(Icon, { name: 'copy', size: 11 }))))))))
+              h('button', { className: 'hb-idbtn', title: 'Copy session id', onClick: () => copyText(item.key) }, h('code', null, item.key), h(Icon, { name: 'copy', size: 11 }))))))),
+    // Outside the viewer: its open animation's transform would offset a fixed-position menu.
+    menu && h(ContextMenu, { menu, onClose: closeMenu }))
 }
 
 
@@ -2607,23 +3027,50 @@ function MaskedForm({ req, busy, reply }) {
 
 // ── inline chat ──
 
+// The unsent message of a session's viewer / card chat survives closing them. Keyed by the stored
+// session key, which stays the same when a resume gives the session a new live id.
+function useChatDraft(board, item) {
+  const key = item ? item.key || item.id : ''
+  const [text, setTextState] = useState(() => board.state.chatDrafts.get(key) || '')
+  const setText = v => {
+    setTextState(v)
+    if (!key) return
+    if (v) board.state.chatDrafts.set(key, v)
+    else board.state.chatDrafts.delete(key)
+  }
+  return [text, setText]
+}
+
+// A restored draft opens with the caret at its end (typing continues it) and the box sized to fit.
+function focusAtEnd(el, maxHeight) {
+  if (!el) return
+  el.focus()
+  const end = el.value.length
+  el.setSelectionRange(end, end)
+  if (!end) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
+  el.scrollTop = el.scrollHeight
+}
+
 function ChatPanel({ item, board }) {
-  const [text, setText] = useState('')
+  const [text, setText] = useChatDraft(board, item)
   const [sending, setSending] = useState(false)
   const scroller = useRef(null)
   const tr = board.state.transcript.get(item.id)
   const running = item.column === 'running'
-  const stream = running ? item.turn?.stream : ''
+  const stream = running ? item.turn?.pending || '' : ''
 
   useEffect(() => {
     if (item.live && (!tr || tr.stale) && !tr?.loading) void board.loadTranscript(item)
   }, [item.live, tr, tr?.stale, board, item.id])
 
-  const messages = (tr?.messages || []).filter(m => m.role === 'user' || m.role === 'assistant').slice(-8)
+  const tail = unseenTail(board.state.tail.get(item.id), tr, running)
+  const messages = [...(tr?.messages || []), ...tail].filter(m => m.role === 'user' || m.role === 'assistant').slice(-8)
   useEffect(() => {
     const el = scroller.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [messages.length, stream?.length])
+  }, [messages.length, tail.length, stream?.length])
 
   if (!item.live) {
     return h('div', { className: 'hb-row' },
