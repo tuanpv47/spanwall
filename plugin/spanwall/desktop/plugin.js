@@ -3027,23 +3027,50 @@ function MaskedForm({ req, busy, reply }) {
 
 // ── inline chat ──
 
+// The unsent message of a session's viewer / card chat survives closing them. Keyed by the stored
+// session key, which stays the same when a resume gives the session a new live id.
+function useChatDraft(board, item) {
+  const key = item ? item.key || item.id : ''
+  const [text, setTextState] = useState(() => board.state.chatDrafts.get(key) || '')
+  const setText = v => {
+    setTextState(v)
+    if (!key) return
+    if (v) board.state.chatDrafts.set(key, v)
+    else board.state.chatDrafts.delete(key)
+  }
+  return [text, setText]
+}
+
+// A restored draft opens with the caret at its end (typing continues it) and the box sized to fit.
+function focusAtEnd(el, maxHeight) {
+  if (!el) return
+  el.focus()
+  const end = el.value.length
+  el.setSelectionRange(end, end)
+  if (!end) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
+  el.scrollTop = el.scrollHeight
+}
+
 function ChatPanel({ item, board }) {
-  const [text, setText] = useState('')
+  const [text, setText] = useChatDraft(board, item)
   const [sending, setSending] = useState(false)
   const scroller = useRef(null)
   const tr = board.state.transcript.get(item.id)
   const running = item.column === 'running'
-  const stream = running ? liveReply(item.turn, tr) : ''
+  const stream = running ? item.turn?.pending || '' : ''
 
   useEffect(() => {
     if (item.live && (!tr || tr.stale) && !tr?.loading) void board.loadTranscript(item)
   }, [item.live, tr, tr?.stale, board, item.id])
 
-  const messages = (tr?.messages || []).filter(m => m.role === 'user' || m.role === 'assistant').slice(-8)
+  const tail = unseenTail(board.state.tail.get(item.id), tr, running)
+  const messages = [...(tr?.messages || []), ...tail].filter(m => m.role === 'user' || m.role === 'assistant').slice(-8)
   useEffect(() => {
     const el = scroller.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [messages.length, stream?.length])
+  }, [messages.length, tail.length, stream?.length])
 
   if (!item.live) {
     return h('div', { className: 'hb-row' },
