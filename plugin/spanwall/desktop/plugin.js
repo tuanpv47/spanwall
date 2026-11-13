@@ -414,7 +414,9 @@ function createBoard(ctx) {
         if (t.status !== 'running') startTurn(uid, p.turn_id)
         if (typeof p.text === 'string') {
           t.stream = (t.stream + p.text).slice(-STREAM_LIMIT)
-          t.pending = (t.pending + p.text).slice(-STREAM_LIMIT)
+          // Never clipped: the viewer renders the whole segment, and cutting its head would rewrap
+          // (and re-parse the Markdown of) everything above the newest line on every delta.
+          t.pending += p.text
         }
         break
       }
@@ -1313,7 +1315,7 @@ const CSS = `
 .hb-ghost.hb-on{color:var(--hb-fg);background:color-mix(in srgb,currentColor 8%,transparent)}
 .hb-vmain{flex:1;min-height:0;display:flex}
 .hb-vchat{flex:1;min-width:0;display:flex;flex-direction:column}
-.hb-transcript{flex:1;min-height:0;overflow-y:auto;padding:28px 24px 12px}
+.hb-transcript{flex:1;min-height:0;overflow-y:auto;overflow-anchor:none;padding:28px 24px 12px}
 .hb-tcol{max-width:820px;margin:0 auto;display:flex;flex-direction:column;gap:22px}
 .hb-tempty{display:flex;align-items:center;justify-content:center;gap:8px;padding:60px 0;color:var(--hb-fg4)}
 .hb-trow{display:flex;flex-direction:column;gap:6px;min-width:0}
@@ -2742,6 +2744,7 @@ function SessionModal({ board, ctx, item: liveItem }) {
   const scroller = useRef(null)
   const inputRef = useRef(null)
   const stick = useRef(true)
+  const lastTop = useRef(0)
   const close = () => board.closeViewer()
   const closeRef = useRef(close)
   closeRef.current = close
@@ -2845,7 +2848,12 @@ function SessionModal({ board, ctx, item: liveItem }) {
         h('div', { className: 'hb-vchat' },
           h('div', { className: 'hb-transcript', ref: scroller, onScroll: e => {
             const el = e.currentTarget
-            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+            const fromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+            // Any step up lets go of the bottom: a smooth wheel or trackpad moves a few px per frame,
+            // never 80 at once, and the next delta would pull the reader straight back down.
+            if (el.scrollTop < lastTop.current - 1 && fromBottom > 1) stick.current = false
+            else if (fromBottom < 80) stick.current = true
+            lastTop.current = el.scrollTop
           } },
             h('div', { className: 'hb-tcol', ref: colRef },
               tr?.loading && !messages.length && h('div', { className: 'hb-tempty' }, h('span', { className: 'hb-spin' }), 'Loading conversation…'),
